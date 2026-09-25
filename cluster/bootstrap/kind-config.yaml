@@ -1,0 +1,30 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: soc-lab
+
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.34.0
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "zerotrust.lab/zone=control,zerotrust.lab/role=control-plane"
+    extraPortMappings: []
+  - role: worker
+    image: kindest/node:v1.34.0
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "zerotrust.lab/zone=workload,zerotrust.lab/role=worker"
+  - role: worker
+    image: kindest/node:v1.34.0
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "zerotrust.lab/zone=workload,zerotrust.lab/role=worker"

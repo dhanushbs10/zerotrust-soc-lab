@@ -1,0 +1,72 @@
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+secrets/*
+!secrets/*.example.yaml
+*.secret.yaml
+serviceaccount-token*
+*-token.json
+
+# Cluster state - never commit
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+cluster-state/
+.clusters/
+*.tar
+*.tar.gz
+
+# Attack and detection run artifacts
+attack/results/
+attack/transcripts/
+detections/results/
+
+# Build output
+node_modules/
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage/
+
+# Logs and scratch
+*.log
+scratch/
+tmp/
+.temp/
+local/
+
+# Local overrides
+*.local.yaml
+*.local.yml
+docker-compose.override.yml
+
+# IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
