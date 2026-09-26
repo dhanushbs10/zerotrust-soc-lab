@@ -6,7 +6,7 @@ Phases are build order, not scope reduction. Each ends with something runnable.
 |---|---|---|---|
 | 0 | Foundations | **done** | repo is clean, hooks pass, one command builds a 3-node cluster |
 | 1 | Trust boundaries | **done** | namespaces default-deny; every pod has a distinct identity |
-| 2 | Least privilege | not started | no workload holds an unneeded permission; drift fails a test |
+| 2 | Least privilege | **done** | no workload holds an unneeded permission; drift fails a test |
 | 3 | Secrets and supply chain | not started | secret sprawl and vulnerable images catalogued |
 | 4 | Privilege paths | not started | each documented path is walkable by script |
 | 5 | Telemetry | **partial** | audit, runtime, and network data tagged with ATT&CK IDs |
@@ -49,6 +49,43 @@ Phases are build order, not scope reduction. Each ends with something runnable.
 - Preflight refuses to run if kube-router is not ready on every node. Under
   kindnet every network assertion would report confidently and wrongly.
 
+## Phase 2 deliverables
+
+- `tools/scan-drift.ps1` — compares each service account's real grants against
+  its documented need, and reports hardening gaps
+- `drift/baseline.json` — the 10 expected findings, each with a written reason
+
+### Verified, not assumed
+
+`tools/scan-drift.ps1` — **10 expected, 10 observed, 0 new, 0 disappeared**
+(`.telemetry/drift-scan.json`)
+
+Both drift directions were proved to fail, which is the only thing that makes a
+baseline meaningful:
+
+- **New finding.** A `RoleBinding` granting `sa-postgres` the config-reader role
+  produced 2 findings, graded MEDIUM for the ConfigMap and HIGH for the Secret,
+  and exit 1. Removing it returned the scan to exit 0.
+- **Disappeared finding.** A baseline entry naming a finding that no longer
+  exists produced `disappeared 1` and exit 1. This is the direction that matters
+  most: every baselined finding is a planted weakness, so losing one means a
+  detection written against it can no longer be tested, and nothing else in the
+  suite would notice.
+
+Three design decisions worth keeping:
+
+- **Expectations are longhand, not derived from the manifests.** A scanner that
+  reads the RBAC files and reports that the RBAC files match itself cannot fail.
+  `sa-build-runner`'s documented need is the empty set, which is the honest
+  answer for a CI runner and is what makes PP-01 report as HIGH rather than
+  quietly pass.
+- **Finding keys use namespace, app label and resource name, never a pod name.**
+  Pod names embed a ReplicaSet hash and a random suffix, so keying on one turns
+  every rollout into phantom drift in both directions.
+- **Unknown-service-account checks are scoped to the lab namespaces.** An
+  unscoped version flagged all 50-odd `kube-system` accounts and buried the 10
+  findings that matter.
+
 ## Findings so far
 
 - **Kubernetes does not log API activity by default.** A default cluster has no
@@ -82,6 +119,18 @@ Phases are build order, not scope reduction. Each ends with something runnable.
   `sa-telemetry-agent` held a read-only ClusterRole that never worked, for the
   reason above. It was removed; the token stays, because it is the sensor's
   identity in the audit log.
+- **PowerShell silently unrolls an empty array returned from a function.**
+  `return @()` emits nothing, so the caller gets `$null`, not an empty array,
+  and the first `.Count` on it throws under `Set-StrictMode`. The fix is a
+  leading comma — `return , @()` — which undoes exactly one level of unrolling.
+  Every array accessor in `tools/scan-drift.ps1` depends on this, and the same
+  trap makes `@($null)` a one-element array, which printed an empty `accepted:`
+  line for every finding that was not an accepted risk.
+- **`Set-StrictMode` makes every optional Kubernetes property a landmine.** A
+  `ClusterRoleBinding` has no `metadata.namespace` and most RBAC rules have no
+  `resourceNames`; reading either directly aborts the scan on the first platform
+  object it meets. All Kubernetes object access goes through a `Get-Prop`
+  accessor for this reason.
 
 ## Open decisions
 

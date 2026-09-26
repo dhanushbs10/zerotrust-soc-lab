@@ -1,0 +1,146 @@
+{
+    "generatedAt":  "2026-09-26T10:29:34Z",
+    "note":  "Expected findings. Every entry is a deliberate weakness or an accepted trade-off.\nA finding not in this list is drift and fails the scan. A finding here that has\ndisappeared also fails, because the attack chain in Phase 8 walks these by\nscript and four detections are written against them.",
+    "expectedGrants":  {
+                           "zerotrust-observe/sa-telemetry-agent":  [
+
+                                                                    ],
+                           "zerotrust-build/sa-build-runner":  [
+
+                                                               ],
+                           "zerotrust/sa-postgres":  [
+
+                                                     ],
+                           "zerotrust/sa-orders-api":  [
+                                                           {
+                                                               "apiGroup":  "",
+                                                               "resourceNames":  [
+                                                                                     "orders-api-config"
+                                                                                 ],
+                                                               "verbs":  [
+                                                                             "get"
+                                                                         ],
+                                                               "resource":  "configmaps"
+                                                           },
+                                                           {
+                                                               "apiGroup":  "",
+                                                               "resourceNames":  [
+                                                                                     "postgres-credentials"
+                                                                                 ],
+                                                               "verbs":  [
+                                                                             "get"
+                                                                         ],
+                                                               "resource":  "secrets"
+                                                           }
+                                                       ],
+                           "zerotrust/sa-web-frontend":  [
+
+                                                         ]
+                       },
+    "acceptedRisk":  {
+                         "rbac/zerotrust-build/sa-build-runner":  [
+                                                                      "PP-01. sa-build-runner is bound to cluster-admin. Planted on purpose: it is the lab headline weakness, it is walked by script in Phase 4, and DET-0001 is written against it. The build zone is genuinely network-isolated and that does not mitigate it, because control-plane access is not pod-to-pod traffic. A CI runner needs no Kubernetes API permissions at all, so the correct grant set for this workload is the empty one."
+                                                                  ],
+                         "identity/token-no-grants/zerotrust-observe/telemetry-agent":  [
+                                                                                            "WP-02. The sensor mounts a token that grants nothing. This is deliberate and is the residue of a removed ClusterRole: kube-router DNATs the API server ClusterIP before the policy chain runs, so no NetworkPolicy written against 10.96.0.1:443 can ever match and the permissions could not have been exercised. The RBAC was removed; the token stays, because it is the sensor identity in the audit log and an unattributable sensor is one nobody can trust afterwards."
+                                                                                        ],
+                         "identity/token-no-grants/zerotrust/web-frontend":  [
+                                                                                 "The web frontend mounts a token it does not need. It does not talk to the API server at all. Kept so that any API activity originating from the pod is attributable to sa-web-frontend rather than to an anonymous identity -- the cheapest possible tripwire, given that this is also the workload with the weakest pod security (WP-01)."
+                                                                             ],
+                         "hardening/statefulsets/postgres/postgres/rootfs":  [
+                                                                                 "A database genuinely needs a writable filesystem, and the stock postgres image writes outside its data directory. The image is kept stock so that the seeded rows and the docker-entrypoint-initdb.d path stay reproducible, which is the property the rest of the lab depends on. Every other postgres control is enforced, and the data directory is a PVC rather than the container root."
+                                                                             ]
+                     },
+    "findings":  [
+                     {
+                         "key":  "hardening/deployments/web-frontend",
+                         "category":  "hardening",
+                         "severity":  "high",
+                         "resource":  "deployments/web-frontend",
+                         "detail":  "no securityContext.runAsNonRoot, so the container starts as uid 0",
+                         "attackId":  "T1610",
+                         "cwe":  "CWE-250"
+                     },
+                     {
+                         "key":  "hardening/deployments/web-frontend/nginx/caps",
+                         "category":  "hardening",
+                         "severity":  "medium",
+                         "resource":  "deployments/web-frontend container nginx",
+                         "detail":  "capabilities are not dropped to ALL",
+                         "attackId":  "T1611",
+                         "cwe":  "CWE-250"
+                     },
+                     {
+                         "key":  "hardening/deployments/web-frontend/nginx/priv-esc",
+                         "category":  "hardening",
+                         "severity":  "medium",
+                         "resource":  "deployments/web-frontend container nginx",
+                         "detail":  "allowPrivilegeEscalation is not false",
+                         "attackId":  "T1611",
+                         "cwe":  "CWE-269"
+                     },
+                     {
+                         "key":  "hardening/deployments/web-frontend/nginx/rootfs",
+                         "category":  "hardening",
+                         "severity":  "low",
+                         "resource":  "deployments/web-frontend container nginx",
+                         "detail":  "readOnlyRootFilesystem is not true",
+                         "attackId":  "T1611",
+                         "cwe":  "CWE-284"
+                     },
+                     {
+                         "key":  "hardening/deployments/web-frontend/seccomp",
+                         "category":  "hardening",
+                         "severity":  "medium",
+                         "resource":  "deployments/web-frontend",
+                         "detail":  "no seccomp profile, so the default Unconfined applies",
+                         "attackId":  "T1611",
+                         "cwe":  "CWE-693"
+                     },
+                     {
+                         "key":  "hardening/statefulsets/postgres/postgres/rootfs",
+                         "category":  "hardening",
+                         "severity":  "low",
+                         "resource":  "statefulsets/postgres container postgres",
+                         "detail":  "readOnlyRootFilesystem is not true",
+                         "attackId":  "T1611",
+                         "cwe":  "CWE-284"
+                     },
+                     {
+                         "key":  "identity/token-no-grants/zerotrust/web-frontend",
+                         "category":  "identity",
+                         "severity":  "low",
+                         "resource":  "Pod/zerotrust/web-frontend",
+                         "detail":  "ServiceAccount zerotrust/sa-web-frontend mounts a token that grants nothing. The token is the pod\u0027s identity in the audit log, so removing it would make the pod\u0027s API activity unattributable, but a credential that authorises nothing is still a credential",
+                         "attackId":  "T1550.001",
+                         "cwe":  ""
+                     },
+                     {
+                         "key":  "identity/token-no-grants/zerotrust-observe/telemetry-agent",
+                         "category":  "identity",
+                         "severity":  "low",
+                         "resource":  "Pod/zerotrust-observe/telemetry-agent",
+                         "detail":  "ServiceAccount zerotrust-observe/sa-telemetry-agent mounts a token that grants nothing. The token is the pod\u0027s identity in the audit log, so removing it would make the pod\u0027s API activity unattributable, but a credential that authorises nothing is still a credential",
+                         "attackId":  "T1550.001",
+                         "cwe":  ""
+                     },
+                     {
+                         "key":  "rbac/zerotrust-build/sa-build-runner/*|*|*|",
+                         "category":  "rbac",
+                         "severity":  "high",
+                         "resource":  "ServiceAccount/zerotrust-build/sa-build-runner",
+                         "detail":  "granted *|*|*| via /build-runner-cluster-admin, which is not in the documented need for this workload. The grant is not narrowed by resourceNames, so it covers every Secret in the scope, not one.",
+                         "attackId":  "T1078.001",
+                         "cwe":  ""
+                     },
+                     {
+                         "key":  "rbac/zerotrust-build/sa-build-runner/||*|",
+                         "category":  "rbac",
+                         "severity":  "high",
+                         "resource":  "ServiceAccount/zerotrust-build/sa-build-runner",
+                         "detail":  "granted ||*| via /build-runner-cluster-admin, which is not in the documented need for this workload.",
+                         "attackId":  "T1078.001",
+                         "cwe":  ""
+                     }
+                 ]
+}
