@@ -133,6 +133,31 @@ try {
             sourceIP            = @($record.sourceIPs) -join ','
             userAgent           = $record.userAgent
             stage               = $record.stage
+
+            # Added because telemetry/runtime/collect-runtime.ps1 needs them and
+            # could not have them from an export without them.
+            #
+            # auditID is what folds the two log lines of a single session into
+            # one. Every pod exec is written twice, once at ResponseStarted and
+            # once at ResponseComplete, under one auditID. An export that drops
+            # it cannot deduplicate, and reports exactly twice as many sessions
+            # as occurred.
+            auditID             = $record.auditID
+
+            # requestURI is where the command lives. At Metadata level the query
+            # string is retained, so for pods/exec this carries every argv
+            # element -- including reads of the service account token. It is the
+            # difference between a rule that knows a command ran and a rule that
+            # only knows someone was logged in. Consumers should redact it
+            # before display; the runtime collector does.
+            requestURI          = $record.requestURI
+
+            # Whether the request was granted. 101 for an established exec
+            # stream, 403 when RBAC refused it. Without this, a rule cannot
+            # separate an intrusion from a blocked attempt, and in a lab whose
+            # entire premise is that most things are blocked, that is the
+            # difference between signal and noise.
+            responseCode        = $record.responseStatus.code
         }
 
         $writer.WriteLine(($event | ConvertTo-Json -Compress -Depth 5))
