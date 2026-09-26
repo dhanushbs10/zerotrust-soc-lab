@@ -115,6 +115,21 @@
     null with a stated reason, because a number computed across a reset is
     wrong in a way that looks right.
 
+    How often compared happens is NOT under the operator's control.
+    Measured: two collections 150s apart with no cluster change at all gave
+    compared 8/8 on the first and chain-rebuilt 8/8 on the second, with every
+    chain name different. An earlier pair 12 minutes apart gave compared 8/8
+    again. So the same quiet cluster yields both states depending on when you
+    look. kube-router logs nothing when it regenerates and exposes no flag to
+    control it, so the interval cannot be predicted or forced.
+
+    Consequence, and this is the part a consumer has to get right: the
+    cumulative counter is the reliable reading, and the delta is a refinement
+    that is frequently unavailable. Anything downstream must treat
+    deltaValid=false as normal and be able to decide from the absolute counter
+    alone. A detection that requires a delta to fire would be dark most of the
+    time, which is the worst possible failure mode for a detector.
+
 .PARAMETER ClusterName
     kind cluster name. Defaults to soc-lab.
 
@@ -534,9 +549,42 @@ foreach ($c in $chainRecords) {
 # is not what a detection on this lab should be reading.
 $LabZones = @('zerotrust', 'zerotrust-build', 'zerotrust-observe')
 
+# The lab's own monitoring, declared rather than inferred.
+#
+# Measured: all 4 lab-zone (cross-zone) flows in this cluster originate from
+# sa-telemetry-agent. That is not a coincidence -- the sensor is the only thing
+# in the lab with a cross-zone grant, because PP-02 gives it observation
+# ingress to web-frontend, orders-api and postgres. So 100% of the traffic a
+# T1021 rule would match here is the lab checking its own policies.
+#
+# The tag stays. Suppressing it would hide a genuine cross-zone connection the
+# moment a non-sensor source appears, and the collector has no business deciding
+# that. What changes is that the event now says who the source is, so a Phase 7
+# rule can exclude instrumentation explicitly instead of discovering later that
+# its only hits were the heartbeat.
+$InstrumentationAccounts = @('sa-telemetry-agent')
+
 foreach ($f in $flows) {
     $bothLab = (($LabZones -contains $f.source.namespace) -and ($LabZones -contains $f.dest.namespace))
     $scope = if ($bothLab) { 'lab-zone' } else { 'cluster-internal' }
+    $isInstrumentation = ($InstrumentationAccounts -contains $f.source.serviceAccount)
+
+    # Computed here, not inline in the hashtable below, and then forced to a
+    # typed array. Both steps are load-bearing and neither is cosmetic.
+    #
+    # PowerShell 5.1's ConvertTo-Json unwraps an array of 0 or 1 elements when
+    # the value arrives from an if-expression, so a field declared as a list
+    # serialises as {} when it is empty and as a bare object when it holds one
+    # entry. Measured here: 192 of 200 flow events carried
+    # "candidateTechniques":{} instead of []. A consumer that iterates the field
+    # -- which is every consumer, including the Phase 9 dashboard -- then reads
+    # a list as an object. @() turns a scalar or $null into an array, and the
+    # [object[]] cast is what survives the serialiser.
+    $techs = if ($bothLab) {
+        @([pscustomobject]@{ id = 'T1021'; name = 'Remote Services'; why = 'an established pod-to-pod connection between trust zones' })
+    }
+    else { @() }
+    $techs = [object[]]@($techs)
 
     $events += [pscustomobject]@{
         schema        = 'network/observed-flow/v1'
@@ -546,6 +594,10 @@ foreach ($f in $flows) {
         source        = [pscustomobject]@{
             ip = $f.source.ip; pod = $f.source.name; namespace = $f.source.namespace
             app = $f.source.app; serviceAccount = $f.source.serviceAccount; zone = $f.source.zone
+            # instrumentation | workload
+            # instrumentation means this is the lab observing itself: a declared
+            # sensor with an intentional cross-zone grant, not adversary traffic.
+            role = if ($isInstrumentation) { 'instrumentation' } else { 'workload' }
         }
         dest          = [pscustomobject]@{
             ip = $f.dest.ip; pod = $f.dest.name; namespace = $f.dest.namespace
@@ -560,11 +612,16 @@ foreach ($f in $flows) {
         # Only lab-zone flows are candidates for a detection on this lab. Marking
         # cluster-internal traffic as a candidate would be a rule that fires on
         # DNS and says nothing about the lab.
-        candidateTechniques = if ($bothLab) {
-            @([pscustomobject]@{ id = 'T1021'; name = 'Remote Services'; why = 'an established pod-to-pod connection between trust zones' })
-        } else { @() }
-        note           = if ($bothLab) { 'candidate technique, not a detection. Firing is Phase 7.' }
-                        else { 'cluster plumbing, not lab traffic; retained rather than dropped so the count stays auditable' }
+        candidateTechniques = $techs
+        note           = if (-not $bothLab) {
+                             'cluster plumbing, not lab traffic; retained rather than dropped so the count stays auditable'
+                         }
+                         elseif ($isInstrumentation) {
+                             'candidate technique, not a detection. SOURCE IS THE LAB''S OWN SENSOR: this is PP-02 observation traffic, so a detection on this technique must exclude role=instrumentation or its only hits will be the lab checking its own policies'
+                         }
+                         else {
+                             'candidate technique, not a detection. Firing is Phase 7.'
+                         }
     }
 }
 

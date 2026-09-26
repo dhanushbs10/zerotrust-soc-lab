@@ -129,7 +129,7 @@ $TokenTechniques = @(
     [pscustomobject]@{
         id = 'T1528'
         name = 'Steal Application Access Token'
-        why = 'a token was minted for a service account by something other than the node that runs the pod'
+        why = 'a token was minted for a service account by a requester outside the measured baseline: either not the node that runs the pod, or acting under an impersonated identity that is not who the token will be judged by'
         mappingBasis = 'judgement: minting a token is not theft, but an acquisition of a credential the requester was not scheduled to hold. Flagged, not called an attack'
     }
 )
@@ -674,6 +674,9 @@ function Get-RequesterClass {
 foreach ($t in $tokenRows) {
     $requester = $t.effectiveIdentity
     $class = Get-RequesterClass -Identity $requester -Impersonated $t.impersonated
+    # The two classes outside the measured baseline. Everything else is the
+    # cluster doing its job, and is left untagged on purpose.
+    $isOffBaseline = ($class -eq 'other' -or $class -eq 'impersonated')
     $attestedNode = $null
     if ($requester -match '^system:node:(.+)$') { $attestedNode = $Matches[1] }
     $podsOnNode = @()
@@ -687,6 +690,15 @@ foreach ($t in $tokenRows) {
         'impersonated' { 'requested under an impersonated identity, so the requester is not the identity the token will be judged by' }
         default { 'a token was requested for this service account by a caller that is neither a kubelet nor a control plane component. Worth a human look; not proof of anything on its own' }
     }
+
+    # Computed here and forced to a typed array. See the matching comment in
+    # telemetry\network\collect-network.ps1: PowerShell 5.1's ConvertTo-Json
+    # unwraps a 0- or 1-element array arriving from an if-expression, so an
+    # inline assignment here serialised all 151 untagged token requests as
+    # "candidateTechniques":{} instead of []. @() normalises, [object[]] is what
+    # survives the serialiser.
+    $taggedTechs = if ($isOffBaseline) { $TokenTechniques } else { @() }
+    $taggedTechs = [object[]]@($taggedTechs)
 
     $events += [pscustomobject]@{
         schema        = 'runtime/token-request/v1'
@@ -717,8 +729,23 @@ foreach ($t in $tokenRows) {
         interpretation = $interpretation
 
         resolution    = 'the request is logged; the token value is never in the audit log, so a token minted here cannot be read back from this source'
-        candidateTechniques = $TokenTechniques
-        note          = 'candidate technique, not a detection. Firing is Phase 7.'
+
+        # Tagged only where the rationale above actually holds.
+        #
+        # Measured: 135 token requests, 78 kubelet and 57 control-plane-component,
+        # 0 off-baseline. Tagging all 135 would put a T1528 candidate on every
+        # event, including 78 whose own requesterClass is 'kubelet' -- the node
+        # that *does* run the pod, which is the exact opposite of the stated
+        # rationale. A tag whose condition its own data refutes is a false
+        # positive waiting to be inherited by Phase 7, so the tag is emitted
+        # only for 'other' and 'impersonated', and the untagged case says why.
+        candidateTechniques = $taggedTechs
+        note          = if ($isOffBaseline) {
+                             'candidate technique, not a detection. Firing is Phase 7.'
+                         }
+                         else {
+                             ('no candidate technique: requesterClass is {0}, which is on the measured baseline of a healthy cluster. Minting a token is not theft, and this is what the kubelet and the control plane are supposed to do' -f $class)
+                         }
     }
 }
 
