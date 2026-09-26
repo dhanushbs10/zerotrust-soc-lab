@@ -1,0 +1,192 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZeroTrust SOC Lab</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <h1>ZeroTrust SOC Lab</h1>
+    <span class="sub">soc-lab &middot; kind v1.34.0</span>
+  </div>
+  <div class="health" id="health">
+    <span class="pill pill-unknown" id="cluster-pill">checking cluster</span>
+    <span class="stamp" id="stamp"></span>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab is-active" data-view="overview" role="tab">Overview</button>
+  <button class="tab" data-view="detections" role="tab">Detections</button>
+  <button class="tab" data-view="graph" role="tab">Reachability</button>
+  <button class="tab" data-view="chain" role="tab">Chain</button>
+  <button class="tab" data-view="stream" role="tab">Event stream</button>
+  <button class="tab" data-view="control" role="tab">Control</button>
+</nav>
+
+<main>
+
+<!-- ── overview ─────────────────────────────────────────────── -->
+<section class="view is-active" data-view="overview">
+  <div class="tiles" id="tiles">
+    <article class="tile" data-k="walks">
+      <p class="tile-k">Privilege paths</p>
+      <p class="tile-v" id="t-walks">&mdash;</p>
+      <p class="tile-n" id="tn-walks">no sweep recorded</p>
+    </article>
+    <article class="tile" data-k="chain">
+      <p class="tile-k">Purple-team chain</p>
+      <p class="tile-v" id="t-chain">&mdash;</p>
+      <p class="tile-n" id="tn-chain">no chain recorded</p>
+    </article>
+    <article class="tile" data-k="detect">
+      <p class="tile-k">Detection rules</p>
+      <p class="tile-v" id="t-detect">&mdash;</p>
+      <p class="tile-n" id="tn-detect">&mdash;</p>
+    </article>
+    <article class="tile" data-k="graph">
+      <p class="tile-k">Open paths</p>
+      <p class="tile-v" id="t-graph">&mdash;</p>
+      <p class="tile-n" id="tn-graph">&mdash;</p>
+    </article>
+  </div>
+
+  <div class="cols">
+    <section class="panel">
+      <h2>Uncovered</h2>
+      <p class="lede">Things the lab walked but cannot detect. A rule cannot fire on
+        a technique no collected schema carries, and rounding that up is how a
+        coverage report becomes fiction.</p>
+      <div id="gaps" class="gaps"><p class="empty">loading&hellip;</p></div>
+    </section>
+
+    <section class="panel">
+      <h2>ATT&amp;CK coverage</h2>
+      <p class="lede">Techniques the registry permits, and how many events carry each.</p>
+      <div id="coverage" class="coverage"><p class="empty">loading&hellip;</p></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <h2>Recent artifacts</h2>
+    <p class="lede">Staleness matters more than absence here. A rotated or truncated
+      log looks exactly like a quiet cluster.</p>
+    <table class="tbl" id="artifacts">
+      <thead><tr><th>file</th><th class="num">size</th><th class="num">age</th></tr></thead>
+      <tbody><tr><td colspan="3" class="empty">loading&hellip;</td></tr></tbody>
+    </table>
+  </section>
+</section>
+
+<!-- ── detections ───────────────────────────────────────────── -->
+<section class="view" data-view="detections">
+  <div class="cols">
+    <section class="panel wide">
+      <h2>Rules</h2>
+      <p class="lede">Every rule is parsed by pySigma, so this is a claim about the
+        reference implementation rather than about this lab's own parser. Rules key
+        on what was <em>run</em>, not who ran it: all 1050 exec sessions in this
+        cluster were opened by <code>kubernetes-admin</code>.</p>
+      <table class="tbl" id="rules">
+        <thead><tr>
+          <th>rule</th><th>technique</th><th class="num">hits</th><th>schema</th>
+        </tr></thead>
+        <tbody><tr><td colspan="4" class="empty">loading&hellip;</td></tr></tbody>
+      </table>
+    </section>
+    <section class="panel">
+      <h2>Matched events</h2>
+      <p class="lede">The first few events each rule fired on.</p>
+      <div id="samples" class="samples"><p class="empty">select a rule</p></div>
+    </section>
+  </div>
+</section>
+
+<!-- ── graph ────────────────────────────────────────────────── -->
+<section class="view" data-view="graph">
+  <section class="panel">
+    <h2>Who can reach what</h2>
+    <p class="lede">Derived from live NetworkPolicies, then every modelled pair
+      verified against the datapath with probe pods dialling Service ClusterIPs.
+      Solid edges are confirmed open; the count of modelled-but-blocked pairs is
+      what a network graph calls closed.</p>
+    <div class="legend">
+      <span><i class="sw sw-open"></i>confirmed open</span>
+      <span><i class="sw sw-closed"></i>modelled, blocked</span>
+      <span><i class="sw sw-nolistener"></i>no listener</span>
+    </div>
+    <div id="graph" class="graph"><p class="empty">loading&hellip;</p></div>
+  </section>
+</section>
+
+<!-- ── chain ────────────────────────────────────────────────── -->
+<section class="view" data-view="chain">
+  <section class="panel">
+    <h2>Purple-team chain</h2>
+    <p class="lede">Six hops assembled from separately catalogued findings.
+      <strong>Rule fires</strong> means a rule for that technique exists and is
+      matching &mdash; not that this hop caused the match. Attributing by technique
+      alone is the agreement-is-not-evidence mistake.</p>
+    <div id="chain" class="chain"><p class="empty">loading&hellip;</p></div>
+  </section>
+</section>
+
+<!-- ── stream ───────────────────────────────────────────────── -->
+<section class="view" data-view="stream">
+  <section class="panel">
+    <h2>Event stream</h2>
+    <p class="lede">Collected events, credential-shaped values redacted. Bounded on
+      purpose: this is for looking at an individual event, not for pulling the
+      whole corpus into a tab.</p>
+    <div class="filters">
+      <label>schema
+        <select id="schema-filter">
+          <option value="">(all)</option>
+          <option value="runtime/container-exec/v1">runtime/container-exec/v1</option>
+          <option value="runtime/token-request/v1">runtime/token-request/v1</option>
+          <option value="runtime/pod-log-read/v1">runtime/pod-log-read/v1</option>
+          <option value="runtime/workload-identity/v1">runtime/workload-identity/v1</option>
+          <option value="network/observed-flow/v1">network/observed-flow/v1</option>
+          <option value="network/denial-counter/v1">network/denial-counter/v1</option>
+        </select>
+      </label>
+      <label>limit
+        <select id="limit-filter">
+          <option>50</option><option selected>100</option><option>250</option><option>500</option>
+        </select>
+      </label>
+      <button class="btn" id="reload-stream">reload</button>
+    </div>
+    <div id="stream" class="stream"><p class="empty">loading&hellip;</p></div>
+  </section>
+</section>
+
+<!-- ── control ──────────────────────────────────────────────── -->
+<section class="view" data-view="control">
+  <section class="panel">
+    <h2>Control</h2>
+    <p class="lede">These run the lab's own scripts. The list is a fixed allowlist
+      in <code>dashboard/server.py</code>; there is no endpoint that takes a command
+      from the browser. This process can mint a cluster-admin token, so it binds to
+      loopback only and has no authentication.</p>
+    <div id="actions" class="actions"><p class="empty">loading&hellip;</p></div>
+  </section>
+
+  <section class="panel">
+    <h2>Job output</h2>
+    <div id="jobs" class="jobs"><p class="empty">no jobs yet</p></div>
+  </section>
+</section>
+
+</main>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

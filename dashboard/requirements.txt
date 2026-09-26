@@ -1,0 +1,4 @@
+# Pinned. The console is the only component in this repo with a third-party
+# runtime dependency; everything else is stdlib or already present (PyYAML for
+# the Sigma rules, pySigma for validating them).
+flask==3.1.3
