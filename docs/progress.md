@@ -8,7 +8,7 @@ Phases are build order, not scope reduction. Each ends with something runnable.
 | 1 | Trust boundaries | **done** | namespaces default-deny; every pod has a distinct identity |
 | 2 | Least privilege | **done** | no workload holds an unneeded permission; drift fails a test |
 | 3 | Secrets and supply chain | **done** | secret sprawl and vulnerable images catalogued |
-| 4 | Privilege paths | not started | each documented path is walkable by script |
+| 4 | Privilege paths | **done** | each documented path is walkable by script |
 | 5 | Telemetry | **partial** | audit, runtime, and network data tagged with ATT&CK IDs |
 | 6 | Correlation graph | not started | who-can-reach-what answers correctly |
 | 7 | Detections | not started | every rule fires against a real attack step |
@@ -97,9 +97,9 @@ Three design decisions worth keeping:
 
 ### Verified, not assumed
 
-All four harnesses pass together: **33 boundary assertions, 10 drift findings,
-85 image advisories, 2 secret findings.**
-
+The four Phase 3 harnesses pass together: **33 boundary assertions, 10 drift
+findings, 85 image advisories, 2 secret findings.** Phase 4 adds a fifth; see
+below.
 **85 advisory records across 6 images**, none of them simulated. Every number
 comes either from a file read out of a running container or from a response
 cached in `.telemetry/osv-cache/`.
@@ -203,8 +203,130 @@ real API. The lab total of 85 advisories includes its 30.
   not flagged as sprawl because nothing reads it, which is precisely why it is
   worth noticing.
 
+## Phase 4 deliverables
+
+- `attack/lib/attacklib.ps1` — shared harness. 17 functions: output formatting,
+  pass/fail accounting, and the kubectl and in-pod plumbing.
+- `attack/run-all.ps1` — runs all five paths, cross-checks them against the
+  catalogue in both directions, writes `.telemetry/walk-summary.json`.
+- `attack/walk-pp-01-cluster-admin.ps1` — 10 assertions
+- `attack/walk-pp-02-sensor-reach.ps1` — 7 assertions
+- `attack/walk-wp-01-frontend-root.ps1` — 9 assertions
+- `attack/walk-wp-02-sensor-token.ps1` — 5 assertions
+- `attack/walk-sp-01-configmap-leak.ps1` — 11 assertions
+- `attack/README.md` — the harness contract, the PowerShell traps, and how to
+  add a path.
+
+### Verified, not assumed
+
+**All five harnesses pass together: 33 boundary assertions, 10 drift findings,
+85 image advisories, 2 secret findings, and 42 privilege-path assertions across
+5 paths.** Every number in the walk output was measured during the run that
+printed it; no `-Observed` value is a hardcoded claim.
+
+The runner distinguishes three failure modes, because they are different
+problems:
+
+| verdict | meaning |
+|---------|---------|
+| `walkable` | exit 0, every assertion held |
+| `CHANGED` | a path's claim no longer matches reality — the interesting failure |
+| `ERRORED` | non-zero exit, no failed assertion — a broken prerequisite |
+| `MISSING` | the walk script is not there |
+
+That distinction was tested, not assumed: a walk with one inverted expectation
+reports `CHANGED`, one that throws before asserting reports `ERRORED`, and a
+missing file reports `MISSING`. 42 passing assertions are only worth something
+if failing is possible.
+
+### Four catalogued claims were wrong, three of them in the direction of overstating risk
+
+Recorded in `attack/catalog/privilege-paths.md` with what changed and why.
+
+- **PP-01** could not be walked from inside the build pod — that zone cannot
+  reach the API server at all. The corrected lesson is sharper than the original:
+  a NetworkPolicy constrains a workload, and a copied credential is no longer a
+  workload.
+- **PP-02** was catalogued as T1078.001, a valid-account technique. It is not an
+  account. It is reconnaissance, T1046.
+- **WP-01** does not omit its `securityContext`. It sets `runAsNonRoot: false`,
+  and has no container-level `securityContext` at all. This is a *stronger*
+  finding than the one it replaces: an opt-out is a decision.
+- **WP-02**'s token is not worth nothing. It holds 3 self-review creates and 20
+  public discovery URLs — `system:basic-user` and the discovery roles that every
+  authenticated identity inherits.
+- **SP-01** is readable by no ordinary workload identity. It is not privilege
+  escalation, and the finding is about rotation rather than theft.
+
+### The measurement that decided SP-01
+
+The obvious way to prove the leaked password works is worthless, and fails in the
+most dangerous way available:
+
+```
+psql -h 127.0.0.1   no password   -> succeeds
+                     wrong password -> succeeds
+```
+
+Both succeed, because `pg_hba.conf` rule 2 trusts `127.0.0.1`. A walk written
+that way would have "proved" the leaked credential works while actually proving
+the database ignores passwords entirely. The walk asserts that inadequacy
+explicitly before relying on anything downstream, then tests the routable pod
+address where rule 7 applies `scram-sha-256`:
+
+```
+10.244.1.7:5432   no password     -> refused
+                   wrong password  -> FATAL: password authentication failed
+                   leaked password -> orders
+```
+
+And the role it authenticates as is not the scoped account its name implies:
+`rolsuper` is `t`, so the credential can create databases and roles, not just
+read orders.
+
+### A fact that reframes the whole lab
+
+**No pod in this cluster can reach the API server.** All four workload
+identities are blocked from 443:
+
+```
+web-frontend     api:443 -> BLOCKED
+orders-api       api:443 -> BLOCKED
+telemetry-agent  api:443 -> BLOCKED
+build-runner     api:443 -> BLOCKED
+```
+
+So every service account token here is latent — none can be spent from where it
+sits. The network policies are carrying the entire containment while RBAC does
+none of the work. "Default-deny plus narrow RBAC" reads like two independent
+controls; in this cluster only one of them is load-bearing, and PP-01 becomes
+live solely because a credential can leave the zone.
+
+### Every walk is read-only
+
+No object is created, patched or deleted, and no row is written. This is not
+caution for its own sake: a detection has to be testable twice against the same
+state, and a demo that can only be run once cannot be used to check a rule twice.
+Irreversible next steps are printed under `withheld` with the exact command and
+the reason.
+
 ## Findings so far
 
+- **The most dangerous way to test a credential is to test it on a route that
+  does not check it.** `pg_hba.conf` trusts `127.0.0.1`, so a leaked-password demo
+  written against loopback passes with no password, with a wrong password, and
+  with the right one. It would have reported a working credential while actually
+  demonstrating that the database ignores passwords. The test that means anything
+  runs against the routable address, where `scram-sha-256` applies, and includes
+  two failures so the one success is not unfalsifiable.
+- **An assertion can pass while measuring nothing.** Four `kubectl auth can-i`
+  calls that all failed returned error strings, none of which contained the word
+  `yes`, so "no identity can read the leak" passed. A walk now asserts that every
+  call returned a real yes-or-no *before* asserting anything about the yeses.
+- **A loop variable read after its loop reports only the last iteration.** An
+  assertion labelled "every one of the four checks is refused" was testing one.
+  Verify one thing and report four is the worst bug in a walk script, because
+  the summary is what a reader trusts.
 - **Kubernetes does not log API activity by default.** A default cluster has no
   record of who did what. Enabling it needs four things at once: the policy
   file on the node, `extraVolumes` to expose it to the API server container,
@@ -219,10 +341,15 @@ real API. The lab total of 85 advisories includes its 30.
   discarded, and `kubectl apply --dry-run=client` reports success. Six
   NetworkPolicies vanished this way while every hook passed.
   `tools/validate-yaml.py` now rejects duplicate keys.
-- **RBAC and network reach are independent axes.** PP-01's service account is
-  network-isolated to DNS-only and still reads every Secret in the cluster,
-  because control-plane access is not pod-to-pod traffic. The network policy is
-  in no position to stop it.
+- **RBAC and network reach are independent axes — and in this lab the network
+  axis is strictly stronger.** PP-01's service account is network-isolated to
+  DNS-only and still reads every Secret in the cluster, because control-plane
+  access is not pod-to-pod traffic. Measured: the build zone cannot reach the
+  API server at all, and neither can any other pod. So no token in this cluster
+  can be spent from where it sits, and PP-01 is live only because a credential
+  can leave the zone. The general lesson survived the measurement and got
+  sharper: a NetworkPolicy constrains a workload, and a copied credential is no
+  longer a workload.
 - **An ingress allowance can be live in review and dead in the datapath.**
   `web-frontend-ingress` admitted two sources whose own egress policies
   permitted neither. `tools/test-boundaries.ps1` caught it; the dead rules were
@@ -321,3 +448,20 @@ real API. The lab total of 85 advisories includes its 30.
 - Branch protection and required checks on `main`.
 - Audit policy level: raise to `RequestResponse` for a narrow resource set, or
   keep `Metadata` everywhere and accept losing request bodies.
+- **SP-01 is now weaker than catalogued, and the fix is a judgement call.** No
+  ordinary workload identity can read `app-config-leak`; only the cluster-admin
+  identity from PP-01 can. Options are to leave it as a documented rotation trap,
+  to widen a grant so the leak is reachable by something less privileged, or to
+  reclassify it. Widening a grant to make a finding demonstrable would be
+  building a vulnerability on purpose to prove one, so the current answer is to
+  leave it and report it honestly. Worth a decision before Phase 6's risk graph
+  ranks it.
+- **Whether `orders-api` should stop being nginx.** It is still a hardened static
+  web workload being called an API. Unchanged since Phase 3, and it now sits
+  inside a controlled comparison in WP-01 that depends on the two pods sharing an
+  image digest, so changing it would invalidate that comparison.
+- **Whether to add a postgres client to the telemetry sensor.** SP-01 is proven
+  over the routable address, which is the same network path PP-02 grants the
+  sensor. A real demonstration from the sensor's own vantage point would need a
+  client on the permitted side, which means a new image, a new digest pin and a
+  new advisory count. Not done unilaterally.
