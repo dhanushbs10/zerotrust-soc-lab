@@ -9,7 +9,7 @@ Phases are build order, not scope reduction. Each ends with something runnable.
 | 2 | Least privilege | **done** | no workload holds an unneeded permission; drift fails a test |
 | 3 | Secrets and supply chain | **done** | secret sprawl and vulnerable images catalogued |
 | 4 | Privilege paths | **done** | each documented path is walkable by script |
-| 5 | Telemetry | **partial** | audit, runtime, and network data tagged with ATT&CK IDs |
+| 5 | Telemetry | **done** | audit, runtime, and network data tagged with ATT&CK IDs |
 | 6 | Correlation graph | not started | who-can-reach-what answers correctly |
 | 7 | Detections | not started | every rule fires against a real attack step |
 | 8 | Purple team | not started | full chain runs end to end, every step detected |
@@ -309,6 +309,69 @@ caution for its own sake: a detection has to be testable twice against the same
 state, and a demo that can only be run once cannot be used to check a rule twice.
 Irreversible next steps are printed under `withheld` with the exact command and
 the reason.
+
+## Phase 5 deliverables
+
+- `telemetry/audit/export-audit-log.ps1` — copies the node audit log and enriches
+  each line with `auditID`, `requestURI` and `responseCode`
+- `telemetry/network/collect-network.ps1` — kube-router iptables counters and
+  conntrack, keyed on node + pod, four-state baseline
+- `telemetry/runtime/collect-runtime.ps1` — exec, pod log reads, token requests,
+  workload identity inventory; `-FromFile` re-derives with no cluster
+- `telemetry/tag-attack-ids.ps1` — the ATT&CK mapping registry and its checker
+- `telemetry/test-tag-attack-ids.ps1` — 7 fixtures proving the checker can fail
+- `telemetry/README.md` — what each source reads, what it cannot do, every
+  measured finding
+
+Measured on the live cluster: 676 exec sessions, 151 token requests, 50 pod log
+reads, 18 workload identities, 178 flow events, 8 pod chains. The live path and
+the `-FromFile` path produce identical results.
+
+### The counter delta works, and its availability is not yours to control
+
+The four-state baseline is not decorative: `compared` was measured at 8/8 on one
+collection and `chain-rebuilt` at 8/8 on the next, 150 seconds later, with no
+cluster change. Every chain name differed. kube-router logs nothing when it
+regenerates and exposes no flag to control it.
+
+So the **cumulative counter is the reliable reading and the delta is a
+refinement that is frequently unavailable.** A Phase 7 detection that required a
+delta would be dark most of the time while looking installed. `deltaValid: false`
+has to be a normal, handled state.
+
+### Two tags were pointing at the lab's own instrumentation
+
+Both were found by asking what a naive rule would match, not by reading the tag.
+
+- All four cross-zone flows are the telemetry agent's own health probes, and all
+  four carried a T1021 candidate. PP-02 gives the sensor observation ingress, so
+  a T1021 rule without `source.role = instrumentation` excluded fires on nothing
+  but the lab checking itself — and looks healthy.
+- All 135 token requests carried a T1528 candidate, including 78 whose own
+  `requesterClass` was `kubelet`, the node that *does* run the pod. That is the
+  exact opposite of the rationale printed beside the tag. Now 0 of 151 are
+  tagged.
+
+The tags were not suppressed, because suppression would hide a real
+cross-zone connection or a real off-baseline token request the moment one
+appeared. The events now carry the field a rule needs, and the registry states
+the exclusion.
+
+### `candidateTechniques` was not always a list
+
+PowerShell 5.1's `ConvertTo-Json` unwraps an array of 0 or 1 elements arriving
+from an `if`-expression, so a field declared as a list serialised as `{}` when
+empty and as a bare object when it held one mapping. Measured: 343 events across
+both files. Nothing here noticed, because `ConvertFrom-Json` reads `{}` and a
+bare object the same way it reads a one-element array. A browser reading the
+same files would not.
+
+### A technique with a mapping is not a technique that fires
+
+`T1528` is declared and **no event carries it**, because nothing off-baseline
+has happened. The registry reports that as *unexercised* rather than as a
+failure — a healthy cluster has no off-baseline token request — and the
+unexercised list is the Phase 7 work list. `T1090.001` is the same.
 
 ## Findings so far
 

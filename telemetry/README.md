@@ -113,11 +113,27 @@ declares one of four states — `no-baseline`, `compared`, `chain-rebuilt`,
 exercised by the test run, including both failure states, and neither failure
 state can produce a negative delta.
 
+**How often `compared` happens is not under the operator's control.** Measured
+directly: two collections 150 seconds apart, with no cluster change of any kind,
+gave `compared` 8/8 on the first and `chain-rebuilt` 8/8 on the second, every
+chain name different. An earlier pair 12 minutes apart gave `compared` 8/8
+again. The same quiet cluster therefore yields both states depending on when
+you look. kube-router logs nothing when it regenerates and exposes no flag to
+control it, so the interval cannot be predicted or forced.
+
+The consequence is the part a consumer has to get right: **the cumulative
+counter is the reliable reading and the delta is a refinement that is frequently
+unavailable.** Anything downstream must treat `deltaValid: false` as normal and
+be able to decide from the absolute counter alone. A detection that required a
+delta in order to fire would be dark most of the time, which is the worst
+available failure mode for a detector — it looks installed and never alerts.
+
 **Most of what conntrack sees is not lab traffic.** Of 173 observed flows, 169
 are `kube-system` to `kube-system` coredns chatter. They are labelled
 `scope: cluster-internal` rather than dropped, so the count stays auditable, and
 they carry no candidate technique — a rule that fires on DNS says nothing about
-this lab.
+this lab. Of the four `lab-zone` flows, **all four are the telemetry agent's
+own sensor**, which is why `source.role: instrumentation` is on the event.
 
 ## Measured baseline for token requests
 
@@ -164,12 +180,92 @@ and a rule that claims otherwise is a rule nobody has tested. The
 merits — two of the mappings here are recorded as judgement calls and one is
 recorded as weak, explicitly, rather than presented as settled.
 
+`tag-attack-ids.ps1` holds the mapping as a single registry and checks the
+collected events against it. It is deliberately not a script that walks the
+events and writes tags onto whatever looks interesting, for two reasons that
+both came out of measurement.
+
+**A tagging pass has no fixed point.** It applies a tag, then reads back its own
+output, and proves only that it ran. Keeping the mapping in a declared table
+means it can be reviewed, argued with, and diffed in a commit, and it turns an
+unmapped event into a failure instead of something nobody notices.
+
+**A tagging pass tags the lab's own instrumentation.** Two cases were found and
+fixed:
+
+- All four cross-zone (`lab-zone`) flows in this cluster are the telemetry
+  agent's own health probes, because PP-02 grants it observation ingress to
+  `web-frontend`, `orders-api` and `postgres`. All four carried a T1021
+  candidate. A Phase 7 rule on T1021 written without excluding
+  `source.role = instrumentation` would have fired on nothing but the lab
+  checking its own policies, and would have looked healthy doing it.
+- All 135 service-account token requests carried a T1528 candidate, including
+  78 whose own `requesterClass` was `kubelet` — the node that *does* run the
+  pod, which is the exact opposite of the rationale printed beside the tag.
+  Now 0 of 151 are tagged, because a token minted by the kubelet or by a
+  control plane component is the measured baseline and not credential theft.
+
+The tag is not suppressed in either case. Suppressing it would hide a genuine
+cross-zone connection or a genuine off-baseline token request the moment one
+appeared. What changed is that the event now carries the field a rule needs to
+tell instrumentation from adversary traffic, and the reason is stated in the
+event.
+
+### The untagged cases, and why each is a stated exemption
+
+An exemption that only checks "the tag is absent" is a hole with a comment over
+it, so every exemption carries a test evaluated against the event's own fields,
+and an untagged event that fails its test is a failure.
+
+| Schema | Coverage | Why untagged is acceptable |
+| --- | --- | --- |
+| `network/denial-counter/v1` | always | never untagged; a refusal is always a T1046 candidate |
+| `network/observed-flow/v1` | conditional | `cluster-internal` is coredns / local-path-provisioner / kubelet, not lab traffic; `lab-zone` with `role=instrumentation` is the lab's own sensor |
+| `runtime/container-exec/v1` | always | never untagged |
+| `runtime/pod-log-read/v1` | always | never untagged |
+| `runtime/token-request/v1` | conditional | `requesterClass` in (`kubelet`, `control-plane-component`), verified against the event |
+| `runtime/workload-identity/v1` | inventory | an inventory of which identity each workload runs as. It records the *absence* of adversary action, so there is nothing to map, and a full exemption here is the correct outcome rather than a warning |
+
+### What the registry reports that is not a failure
+
+`T1528` is declared for `runtime/token-request/v1`, and **no collected event
+currently carries it**, because nothing off-baseline has happened in this lab.
+That is reported as *unexercised*, not as a failure: a healthy cluster has no
+off-baseline token request, and the technique is proven by Phase 7 inducing the
+condition, not by this script pretending it occurred. The unexercised list is
+the Phase 7 work list, and it is written into the report for exactly that
+reason. `T1090.001` (portforward) is declared for the same reason and has also
+never been exercised.
+
+`telemetry/test-tag-attack-ids.ps1` feeds the checker seven fixtures and asserts
+each exit code: six must fail and one must pass. A checker that only ever passes
+is indistinguishable from a checker confirming the lab is healthy, which is the
+failure mode this project has now hit five times.
+
+## A serialization defect worth knowing about
+
+`candidateTechniques` is declared as a list, and it was not always written as
+one. PowerShell 5.1's `ConvertTo-Json` unwraps an array of **0 or 1 elements**
+when the value arrives from an `if`-expression, so the field serialised as `{}`
+when empty and as a bare object when it held a single mapping. Measured: 192 of
+200 flow events and 151 of 895 runtime events carried `"candidateTechniques":{}`
+instead of `[]`.
+
+Nothing in this directory noticed, because PowerShell's own `ConvertFrom-Json`
+reads `{}` and a bare object the same way it reads a one-element array. The
+Phase 9 dashboard reads the same files in a browser, where `{}` iterated as a
+list either throws or silently yields nothing. The fix in both collectors is to
+compute the value into a variable and force it with `[object[]]@(...)`, and the
+reason is commented at both sites so it does not get tidied away.
+
 ## Running
 
 ```powershell
 .\telemetry\audit\export-audit-log.ps1          # -> .telemetry/audit-events.jsonl
 .\telemetry\network\collect-network.ps1         # -> .telemetry/network-events.jsonl
 .\telemetry\runtime\collect-runtime.ps1         # -> .telemetry/runtime-events.jsonl
+.\telemetry\tag-attack-ids.ps1                  # -> .telemetry/attack-tag-report.json
+.\telemetry\test-tag-attack-ids.ps1             # proves the checker can fail
 ```
 
 The runtime collector takes `-FromFile` to re-derive from an existing export
