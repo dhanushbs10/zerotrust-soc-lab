@@ -5,17 +5,45 @@
 # specific requirement, it is an over-permission and should be deleted.
 #
 # Permitted:
-#   web-frontend  <- web-frontend, orders-api   on 80
 #   web-frontend  -> orders-api                 on 8080
-#   orders-api    <- web-frontend               on 8080
 #   orders-api    -> postgres                   on 5432
-#   postgres      <- orders-api                 on 5432
+#   telemetry-agent -> web-frontend            on 80    (PP-02)
+#   telemetry-agent -> orders-api              on 8080  (PP-02)
+#   telemetry-agent -> postgres                on 5432  (PP-02)
 #
 # Not permitted, and the absence is the control:
 #   web-frontend  -> postgres    a web server has no reason to hold a DB session
 #   postgres      -> anywhere    a database that initiates traffic is exfiltrating
-#   orders-api    -> build       the build zone is not on any request path
+#   orders-api    -> web-frontend  the API does not call the frontend
+#   anything      -> build       the build zone is not on any request path
 #   build-runner  -> zerotrust   see 34-networkpolicy-zones.yaml
+#
+# ---------------------------------------------------------------------------
+# A dead ingress allowance, found by tools/test-boundaries.ps1
+# ---------------------------------------------------------------------------
+# This file originally listed web-frontend-ingress as admitting `app:
+# web-frontend` and `app: orders-api`, and wrote a test asserting both could
+# connect. The test failed. The policies were right and the test's expectation
+# was wrong, which is the only acceptable direction for a test to be wrong in.
+#
+# An ingress rule names who may connect to a pod. It says nothing about whether
+# those pods can connect outward, and egress is a separate policy on a separate
+# axis. `web-frontend-egress` permits only orders-api:8080, and
+# `orders-api-egress` permits only postgres:5432, so neither of them can reach
+# web-frontend:80 at all. The two ingress allowances matched no packet and never
+# would have.
+#
+# Both halves are true and the combination is what surprises people: the policy
+# says the frontend is reachable from two sources, and it is reachable from
+# neither. Reviewed on its own, the ingress rule looks permissive and reasonable.
+# Only a test that actually opens the connection reveals that an allowance can
+# be live in review and dead in the datapath.
+#
+# The correct fix is deletion, not an added egress rule. Making orders-api able
+# to call the frontend in order to justify an allowance that nothing needs would
+# be adding an attack path to preserve dead configuration. So web-frontend-ingress
+# now admits the sensor and nobody else. Every rule in this file is live, which
+# is the property that makes the file worth trusting.
 #
 # ---------------------------------------------------------------------------
 # The rule that is easy to forget, and cost this lab an afternoon
@@ -48,19 +76,16 @@ spec:
   policyTypes:
     - Ingress
   ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              app: web-frontend
-        - podSelector:
-            matchLabels:
-              app: orders-api
-      ports:
-        - protocol: TCP
-          port: 80
-    # PP-02: observation access for the sensor. Scoped to the single
-    # telemetry-agent pod by both namespace and pod selector, so a second pod
-    # dropped into the observe namespace does not inherit it.
+    # PP-02: observation access for the sensor, and the only ingress this
+    # workload has. Scoped to the single telemetry-agent pod by both namespace
+    # and pod selector, so a second pod dropped into the observe namespace does
+    # not inherit it.
+    #
+    # The business path to the frontend ends at the frontend: nothing in this
+    # cluster serves it, because there is no external ingress controller. In a
+    # real deployment this is where a gateway, an ingress controller or a CDN
+    # would be named, and the rule would be a real requirement rather than a
+    # sensor making an observation call.
     - from:
         - namespaceSelector:
             matchLabels:

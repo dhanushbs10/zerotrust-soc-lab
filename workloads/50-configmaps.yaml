@@ -34,6 +34,11 @@ data:
   # telemetry agent and the risk graph can both read. Keeping the catalogue in
   # the cluster means a detection can be checked against ground truth instead of
   # against someone's memory.
+  #
+  # The authoritative copy is attack/catalog/privilege-paths.md. This is a
+  # machine-readable subset, and drift between the two is itself a finding:
+  # a detection that fires on a condition the catalogue no longer lists is
+  # either a false positive or a documentation bug.
   weaknesses.yaml: |
     weaknesses:
       - id: WP-01
@@ -41,19 +46,45 @@ data:
         resource: Deployment/web-frontend
         attack_id: T1610
         detection: DET-0007
+      - id: WP-02
+        name: telemetry-agent mounts a token that grants nothing
+        resource: ServiceAccount/sa-telemetry-agent
+        attack_id: T1550.001
+        detection: DET-0009
       - id: SP-01
         name: database password duplicated in a ConfigMap
         resource: ConfigMap/app-config-leak
         attack_id: T1552.001
         detection: DET-0002
+  privileges.yaml: |
+    privilege_paths:
       - id: PP-01
-        name: build-runner service account bound to cluster-admin
+        name: sa-build-runner bound to cluster-admin
         resource: ClusterRoleBinding/build-runner-cluster-admin
         attack_id: T1078.001
+        related_ids: [T1098.003]
         detection: DET-0001
+        network_isolated: true
+        network_isolation_matters: false
+      - id: PP-02
+        name: sensor holds a network path to all business workloads
+        resource: NetworkPolicy (3 ingress rules)
+        attack_id: T1078.001
+        related_ids: [T1046]
+        detection: DET-0008
+        network_isolated: false
+        network_isolation_matters: true
   privileges.md: |
     PP-01 build-runner holds cluster-admin.
       Network: isolated, DNS only.
       Control plane: total. Reads every Secret, creates pods anywhere.
-      Compensating control: none. The isolation and the privilege do not
-      interact, which is why containment fails.
+      The isolation is real and does not help. Control-plane access is not
+      pod-to-pod traffic, so no network policy is in a position to stop it.
+      Compensating control: none. That is the failure.
+
+    PP-02 the sensor can reach web-frontend, orders-api and postgres.
+      Granted on purpose, because a monitor with no reach cannot tell healthy
+      from unreachable.
+      Survives because sa-telemetry-agent holds no API permissions and no
+      database credential, so the path leads to a closed door.
+      Risk: compromising the sensor inherits observation of the business zone.
