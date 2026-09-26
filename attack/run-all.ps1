@@ -50,6 +50,8 @@ $ErrorActionPreference = 'Continue'
 $paths = @(
     @{ id = 'PP-01'; file = 'walk-pp-01-cluster-admin.ps1';  kind = 'privilege path' }
     @{ id = 'PP-02'; file = 'walk-pp-02-sensor-reach.ps1';   kind = 'compensating control' }
+    @{ id = 'PP-03'; file = 'walk-pp-03-token-mint.ps1';      kind = 'privilege path' }
+    @{ id = 'PP-04'; file = 'walk-pp-04-portforward.ps1';    kind = 'privilege path' }
     @{ id = 'WP-01'; file = 'walk-wp-01-frontend-root.ps1';   kind = 'workload weakness' }
     @{ id = 'WP-02'; file = 'walk-wp-02-sensor-token.ps1';   kind = 'workload weakness' }
     @{ id = 'SP-01'; file = 'walk-sp-01-configmap-leak.ps1'; kind = 'stored secret' }

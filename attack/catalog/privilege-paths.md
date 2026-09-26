@@ -25,6 +25,8 @@ is irrelevant until something can reach its process.
 |----|------|---------|--------|-----------|-----------|
 | PP-01 | Privilege path | `sa-build-runner` is bound to `cluster-admin`, and the token leaves the zone it is sealed in | T1078.001, T1190, T1550.001 | `walk-pp-01-cluster-admin.ps1` | 10 |
 | PP-02 | Compensating control | The sensor can open a TCP path to all three business workloads and holds no credential for any of them | T1046, T1550.001 | `walk-pp-02-sensor-reach.ps1` | 7 |
+| PP-03 | Privilege path | A token for the `cluster-admin` ServiceAccount can be minted by impersonating it — same authority as PP-01, no file read | T1528 | `walk-pp-03-token-mint.ps1` | 7 |
+| PP-04 | Privilege path | `pods/portforward` relays through the API server, so NetworkPolicy does not constrain it | T1090.001 | `walk-pp-04-portforward.ps1` | 5 |
 | WP-01 | Weakness | `web-frontend` explicitly sets `runAsNonRoot: false` and has no container-level `securityContext` | T1610, T1611 | `walk-wp-01-frontend-root.ps1` | 9 |
 | WP-02 | Weakness | `sa-telemetry-agent` mounts a token that carries no permission on any cluster resource | T1550.001 | `walk-wp-02-sensor-token.ps1` | 5 |
 | SP-01 | Weakness | The database password is duplicated in a ConfigMap, and it is a live superuser credential | T1552.001 | `walk-sp-01-configmap-leak.ps1` | 11 |
@@ -52,6 +54,15 @@ alarming is not a catalogue.
   identity inherits. The posture is right; the phrasing was not.
 - **SP-01** claimed an unprivileged workload could read the leak. None can. The
   finding is weaker than catalogued and different in kind.
+- **PP-03** was first written against `sa-orders-api` and asserted the mint
+  succeeded. It is refused. Impersonation cannot raise authority, because RBAC is
+  judged as the impersonated identity. The escalation is the mirror image and
+  needed the `cluster-admin` ServiceAccount to be the target. See the correction
+  below.
+- **PP-04** was not in this catalogue at all until Phase 7, because nothing in the
+  lab had used `pods/portforward`. Phase 6's reachability graph reported 19 of 25
+  modelled pairs as dropped and could not see this path; the gap is the relay, not
+  the policy.
 
 ---
 
@@ -209,6 +220,127 @@ catalogued findings rather than a third planted weakness.
 `DET-0008` — a NetworkPolicy granting ingress to a pod in the observe zone.
 Fires on the rule, so it is a posture check rather than an attack signal, and
 it is expected to fire exactly once in a correctly configured lab.
+
+---
+
+## PP-03 — a token can be minted for the `cluster-admin` ServiceAccount
+
+**Resource** `ClusterRoleBinding/build-runner-cluster-admin` → `ClusterRole/cluster-admin`
+**Technique** T1528 Steal Application Access Token
+**Walked by** `attack/walk-pp-03-token-mint.ps1` — 7 assertions
+
+> **Corrected by measurement.** The first version of this walk impersonated
+> `sa-orders-api` and asserted the mint succeeded. It is refused:
+>
+> ```
+> error: failed to create token: serviceaccounts "sa-orders-api" is forbidden:
+>   User "system:serviceaccount:zerotrust:sa-orders-api" cannot create resource
+>   "serviceaccounts/token" in API group "" in the namespace "zerotrust"
+> ```
+>
+> Impersonation does not launder privilege. RBAC is evaluated as the
+> *impersonated* identity, so `--as` can only reduce authority. A walk asserting
+> the opposite would have been demonstrating a vulnerability this cluster does
+> not have — the same error SP-01's walk made before it was corrected.
+
+### Why it exists
+
+The escalation is the mirror image of the refusal. `sa-build-runner` holds
+`cluster-admin`, so asking *as* that identity is permitted, and the token that
+comes back names it:
+
+```
+minted sub = system:serviceaccount:zerotrust-build:sa-build-runner
+audience   = https://kubernetes.default.svc.cluster.local
+exp        = 1790450420        (bounded; this is the mitigation)
+```
+
+Measured authority of the minted credential, with the identical question asked of
+the low-privilege identity for contrast:
+
+| check | minted `sa-build-runner` token | `sa-orders-api` |
+|-------|--------------------------------|-----------------|
+| `list secrets --all-namespaces` | **yes** | no |
+| `list pods --all-namespaces` | **yes** | no |
+| `get configmap/app-config-leak -n zerotrust` | **yes** | no |
+| `create pods -n zerotrust` | **yes** | no |
+
+Both rows are necessary. The grants alone would prove nothing, because the caller
+was already `cluster-admin`; the refusals alone would prove nothing, because
+nothing was attempted. What makes it a privilege path is that the *only* variable
+between the two columns is which ServiceAccount was impersonated.
+
+### How it differs from PP-01
+
+Same blast radius, no filesystem access:
+
+| | PP-01 | PP-03 |
+|---|---|---|
+| how the credential is obtained | read off the pod | minted from nothing |
+| evidence left on the pod | a file access | none |
+| requires reaching the pod | yes | no |
+| expires | no, it is the mounted token | yes, TokenRequest lifetime |
+
+PP-03 is the worse of the two to detect, and that is the reason it is catalogued
+separately. A file read leaves traces a rule can key on; a TokenRequest is an
+ordinary API call that succeeds.
+
+### Detection
+
+`DET-0011` — a `TokenRequest` whose requester is neither the kubelet that owns
+the pod nor a control-plane component. In this cluster 208 of 209 token requests
+are one of those two, so the single exception is the signal. A rule that did not
+require `requesterClass` in `(other, impersonated)` would fire on all 209 and
+mean nothing — which is the mistake the Phase 5 registry was built to prevent.
+
+---
+
+## PP-04 — `pods/portforward` reaches ports NetworkPolicy denies
+
+**Resource** `NetworkPolicy/*` (all of them) vs `pods/portforward`
+**Technique** T1090.001 Proxy: Internal Proxy
+**Walked by** `attack/walk-pp-04-portforward.ps1` — 5 assertions
+
+> **Not in this catalogue until Phase 7**, because nothing in the lab had used
+> `port-forward`. Phase 6 verified 19 of 25 modelled pairs as dropped by the
+> policy chain. This is the boundary of that verification.
+
+### Why it exists
+
+`kubectl port-forward` does not open a connection from the client to the pod. The
+API server opens a connection *from the kubelet into the pod's network namespace*
+and relays bytes over an existing stream. The traffic that reaches `postgres`
+never traverses the pod-to-pod path kube-router governs, so no policy written
+against that path can match it.
+
+Measured in one run, from the same pod, to the same port:
+
+```
+build-runner -> postgres.zerotrust.svc.cluster.local:5432   control resolved, no connection
+port-forward -> postgres:5432 (via 127.0.0.1:15432)        connected
+```
+
+The DNS resolution in the first line is a positive control and is not decoration.
+Every verdict in that step is inferred from the *absence* of a postgres banner,
+and absence of output is also what a broken resolver produces. Without the
+control, the walk would report a policy bypass that is really a DNS failure.
+
+### The honest framing
+
+The control is not weak. It is comprehensive, it is enforced, and it does not
+apply here. That is a different claim from "the policy is misconfigured", and it
+calls for a different fix: this is a gap in what NetworkPolicy is *able* to
+express, not a gap in what it was configured to do. A SOC that reasons purely
+from a reachability graph — as Phase 6's does — will report this path as closed.
+
+### Detection
+
+`DET-0010` — `verb=get, subresource=portforward` in the audit log. It arrives as
+its own subresource and is easy to mistake for an exec session; the collector
+keeps both in one schema and routes them to different techniques, so a
+T1609.001 rule that does not exclude `portforward` will report a tunnel as a
+container exec, and in a cluster where tunnels are rare that misattribution is
+invisible.
 
 ---
 
