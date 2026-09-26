@@ -11,8 +11,8 @@ Phases are build order, not scope reduction. Each ends with something runnable.
 | 4 | Privilege paths | **done** | each documented path is walkable by script |
 | 5 | Telemetry | **done** | audit, runtime, and network data tagged with ATT&CK IDs |
 | 6 | Correlation graph | **done** | who-can-reach-what answers correctly |
-| 7 | Detections | not started | every rule fires against a real attack step |
-| 8 | Purple team | not started | full chain runs end to end, every step detected |
+| 7 | Detections | **done** | every rule fires against a real attack step |
+| 8 | Purple team | **done** | full chain runs end to end, every step detected |
 | 9 | SOC console | not started | dashboard readable during a live attack |
 | 10 | Packaging | not started | fresh clone plus one command reproduces everything |
 
@@ -640,10 +640,173 @@ the graph model, caught the same way — by a check that was looking.
   scripts handed to busybox: a here-string written on Windows produces a script
   that dies with `syntax error: unexpected end of file (expecting "fi")`.
 
+## Phase 7 deliverables
+
+- `detections/<technique>/` — six Sigma rules, one directory per technique
+- `detections/engine/sigmalite.py` — the evaluator, and what it deliberately is not
+- `detections/test-detections.py` — the gate, and proof the gate can fail
+- `detections/README.md` — including the one rule with no attack-step positive
+
+| rule | technique | fires on |
+|------|-----------|----------|
+| `det-0003` | T1609.001, T1550.001 | an exec reading a credential or probing an escape |
+| `det-0004` | T1552.001 | business-zone pod logs read by an operator |
+| `det-0005` | T1046 | refused egress, counter comparable |
+| `det-0006` | T1021 | a flow crossing a trust-zone boundary |
+| `det-0010` | T1090.001 | a granted `pods/portforward` |
+| `det-0011` | T1528 | a TokenRequest from an off-baseline requester |
+
+Every rule is parsed by **pySigma**, the reference implementation, so "this is
+valid Sigma" is a claim about pySigma rather than about this lab's own parser.
+Execution uses `engine/sigmalite.py`, which supports a declared subset and
+*raises* on anything else — a rule using an unimplemented construct must be a
+test failure, never a rule that quietly matches nothing.
+
+The rules key on **the command, not the identity**. All 1050 exec sessions were
+opened by `kubernetes-admin` because the lab is driven from the operator host,
+so an identity rule would fire on every one and mean nothing. No rule carries a
+credential value: the leaked database password appears verbatim in
+`.telemetry/`, and `det-0003` matches the shape `PGPASSWORD=` instead.
+
+### Three harness bugs, all found by running the harness
+
+1. **Rule input was every `*.jsonl` in `.telemetry/`**, which pulled in the 70MB
+   raw audit export *and* `runtime-from-export.jsonl` beside
+   `runtime-events.jsonl`. Rules match the normalized collector schemas, so raw
+   audit records can only match by field-name accident, and the duplicate file
+   inflated every count roughly twofold. Rule input is now the two collector
+   outputs explicitly, and the loader refuses any event with no `schema` field.
+2. **The hit check was a floor (`>= want`)**, which is a gate that cannot fail:
+   replacing a rule's condition with one matching its whole schema *raises* the
+   count and passes. The first green run of the suite proved nothing for exactly
+   that reason. Counts are exact equalities now.
+3. **The mutation harness compared hit counts itself**, so it reported "caught"
+   for mutations the real gate would have passed. It now calls the same
+   `verify_rule()` the suite calls.
+
+### The three-way mutation verdict
+
+`caught` / `equivalent` / `SURVIVED`, where only `SURVIVED` fails. `equivalent`
+means the gate agreed *and* the hit set is byte-identical, which is a real
+finding rather than a pass: five of six rules report one, because dropping their
+`schema` guard changes nothing — their other selections are already specific
+enough that no other schema carries those fields. The guard is defence in depth
+on those five and load-bearing on `det-0004`, where removing it lets the rule
+match `kube-system` log reads.
+
+### The one rule with no attack-step positive
+
+`det-0006` (T1021) fires on 4 events and **all 4 are the lab's own sensor**,
+labelled `source.role = instrumentation`. That is structural: the only cross-zone
+paths the lab grants are PP-02's three sensor grants, so no other workload *can*
+produce a cross-zone flow. Adding a grant to give the rule a positive would
+weaken the lab to prove a point.
+
+The label is also a blind spot. `role` is a lab annotation, not a property of the
+traffic, so a compromised sensor produces byte-identical flows and any rule
+filtering on that field is blind to it — and PP-02 makes that reachable, because
+the sensor is the only pod permitted to touch all three business workloads. The
+exclusion is right for this lab and wrong in the case that matters most.
+
+## Phase 8 deliverables
+
+- `attack/chain-purple-team.ps1` — the six-hop intrusion, end to end
+- `detections/test-detections.py --chain` — which hops have a rule, and which do not
+- `.telemetry/chain-summary.json` — verdicts only, no credential
+
+### The chain
+
+| hop | technique | what | rule |
+|-----|-----------|------|------|
+| 1 | T1609.001 | read the mounted token off the build runner | `det-0003` |
+| 2 | T1552.001 | read the duplicated db password from the ConfigMap | none for ConfigMap reads |
+| 3 | T1090.001 | port-forward to a port NetworkPolicy denies | `det-0010` |
+| 4 | T1528 | mint a token for the cluster-admin ServiceAccount | `det-0011` |
+| 5 | T1078.001 | create a foothold pod in the business zone | **none — no schema** |
+| 6 | T1552.001 | read application data with the stolen password | `det-0003` |
+
+6 hops, 6 succeeded. The foothold carries `app: orders-api` because
+NetworkPolicy selects on labels and not on service account, so a pod dropped into
+the business zone inherits nothing until it claims to be something it is not.
+
+### Audit log rotation was silently discarding 91k records
+
+The most consequential finding of the phase, and it was not in the chain.
+
+Partway through, the exporter reported 1125 records where it had reported 91479.
+The apiserver rotates its own audit log, and at 19:14 it moved 104MB into
+`audit-2026-09-26T19-14-19.668.log`. Both `export-audit-log.ps1` and
+`collect-runtime.ps1` read only `audit.log`.
+
+The failure mode is the one this project keeps relearning: **silent telemetry
+loss is indistinguishable from a quiet cluster.** The exporter exited 0 and
+printed a plausible number. The runtime collector was worse, because it greps
+the node directly instead of reading the export, so it independently reported
+14 exec sessions and 0 pod log reads for a lab that had run 978 — and every
+detection depending on that data quietly stopped matching.
+
+Both now glob `audit*.log` oldest-first (`-` is 0x2D and `.` is 0x2E, so
+rotated files sort before the live one) and print what they read. Recovered:
+108002 records, 1050 exec sessions, 257 token requests, 50 pod log reads.
+
+The Phase 7 exact-count baselines moved as a direct result — `det-0003` 87 → 108,
+`det-0010` 4 → 15 — and were re-baselined with the reason recorded beside them.
+
+### Coverage gap, reported rather than rounded away
+
+hop 5 walks T1078.001. No schema in the registry carries it, so no rule can fire
+on creating a pod with `cluster-admin`, and `--chain` exits 1. The catalogue
+claims T1078.001 and T1190 for PP-01 and **neither is detectable**. That is a
+gap in what this lab collects, not in the rules, and it is the honest answer to
+Phase 8's "every step detected": five of six hops have a firing rule, and the
+sixth cannot have one until something collects API-server object-creation audits
+under a schema the registry permits.
+
+### What `--chain` does not claim
+
+The report says **"rule fires"**, not "detected". A rule carrying the technique
+tag existing and matching is not evidence that *this hop* caused the match. hop 2
+reads a ConfigMap and was credited to `det-0004`, which only ever inspects
+pod-log-read events. The chain records verdicts, not the auditIDs it caused, so
+hop-level attribution would need it to emit them per request.
+
+Calling that "detected" is the agreement-is-not-evidence mistake wearing a
+different hat, and it is the same defect that made Phase 6 report 25/25 open
+paths including 19 that were dropped.
+
+### Three things the chain found that no single walk could
+
+1. **A port-forward's local end is a loopback listener on the client.** Dialling
+   `127.0.0.1:15433` from inside a pod hits that pod's own loopback. PP-04's
+   control-bypass claim stands — the relay reaches a denied port from the host —
+   but the technique is bounded by what the attacker can run locally, and this
+   host has no `psql`.
+2. **postgres-0 cannot reach its own Service ClusterIP.** The default-deny does
+   not permit it, so the one place that looks like the obvious spot to spend a
+   stolen database password is the one place it does not work from. Only
+   `orders-api` and `telemetry-agent` hold that grant, and `orders-api` runs
+   nginx with no `psql`.
+3. **Column discovery took four attempts**, each instructive: a literal
+   `order_id` that does not exist; a `where table_name=orders` filter needing a
+   quoted literal that `Invoke-InPod` forbids, whose *error text* then became the
+   column name; `table_name||column_name` where the shell ate `||` as a pipe;
+   and psql's `\d` where the shell stripped the backslash. The column is now
+   named, and the assertion demands a numeric result so a wrong column fails
+   loudly rather than quietly returning nothing.
+
 ## Open decisions
 
-- Dashboard visual direction: which design skill owns it.
+- **Phase 9 dashboard visual direction is unpicked.** A defensible dark SOC-console
+  aesthetic was chosen and is open to correction. Not blocking.
+- **T1078.001 and T1190 are undetectable** in this lab. The catalogue claims both
+  for PP-01, and no collected schema carries either. Closing this means adding an
+  object-creation audit schema to the registry, which is Phase 9+ work.
+- **Posture detections DET-0001, 0002, 0007, 0008, 0009 are not written.** The
+  catalogue specifies what each should assert, so the specification exists without
+  the implementation. They are configuration checks against live cluster state, a
+  different input from the six telemetry rules.
 - Repository name: `ZeroTrust-SOC-Lab` used so far, rename if preferred.
+- Branch protection on `main`: not enabled.
 - Lab vulnerabilities: synthetic misconfigurations versus pinned real CVEs.
   Current answer, recorded in `attack/catalog/privilege-paths.md`: synthetic
   misconfigurations only, no fabricated CVEs in real pinned images.
