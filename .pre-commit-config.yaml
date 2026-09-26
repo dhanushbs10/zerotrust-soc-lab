@@ -51,3 +51,20 @@ repos:
     rev: v2.15.1
     hooks:
       - id: hadolint
+
+  # The PowerShell suites were run by hand, which is not a control. `af24b8c`
+  # fixed a bug that the `test-tag-attack-ids.ps1` seventh fixture catches: the
+  # fix commit `18a2736` shipped with that fixture already failing, because
+  # nobody re-ran the suite. These two are the cluster-free half of the test
+  # set, so they are the half that can gate a commit. Anything needing a live
+  # cluster (tools/test-boundaries.ps1, the attack sweeps) stays a manual step
+  # and must not be implied to be covered here.
+  - repo: local
+    hooks:
+      - id: lab-selftest
+        name: PowerShell self-tests (no cluster required)
+        entry: >-
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-selftests.ps1
+        language: system
+        pass_filenames: false
+        files: \.(ps1|ya?ml)$
