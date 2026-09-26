@@ -122,13 +122,15 @@ function Get-Prop {
 
 # Returns a real array, never $null, so that .Count is meaningful. Wrapping $null
 # in @() yields a one-element array holding null, which is how a filter written
-# as "@($x).Count -gt 0" ends up matching everything.
+# as "@($x).Count -gt 0" ends up matching everything. The leading comma is also
+# load-bearing: a function that "returns" an empty array emits nothing, so the
+# caller gets $null instead, and .Count on that throws under Set-StrictMode.
 function Get-ArrayOf {
     param($Value)
-    if ($null -eq $Value) { return @() }
-    if ($Value -is [string]) { return @($Value) }
-    if ($Value -is [array]) { return @($Value) }
-    return @($Value)
+    if ($null -eq $Value) { return , @() }
+    if ($Value -is [string]) { return , @($Value) }
+    if ($Value -is [array]) { return , @($Value) }
+    return , @($Value)
 }
 
 # ---------------------------------------------------------------------------
