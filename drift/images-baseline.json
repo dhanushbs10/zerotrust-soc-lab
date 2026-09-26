@@ -1,0 +1,143 @@
+{
+    "generatedAt":  "2026-09-26T10:41:35Z",
+    "note":  "Known state of the pinned images. The scan fails if a digest changes, because\nthat means the running software is not the software that was reviewed, and it\nfails if an advisory is added, because advisories are published about old\nsoftware and a newly-known vulnerability in a pinned image is news.",
+    "workloads":  {
+                      "zerotrust/web-frontend":  {
+                                                     "image":  "docker.io/library/nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10",
+                                                     "packages":  68,
+                                                     "advisories":  [
+                                                                        "ALPINE-CVE-2024-58251",
+                                                                        "ALPINE-CVE-2025-10148",
+                                                                        "ALPINE-CVE-2025-46394",
+                                                                        "ALPINE-CVE-2025-4947",
+                                                                        "ALPINE-CVE-2025-49794",
+                                                                        "ALPINE-CVE-2025-49795",
+                                                                        "ALPINE-CVE-2025-49796",
+                                                                        "ALPINE-CVE-2025-5025",
+                                                                        "ALPINE-CVE-2025-6021",
+                                                                        "ALPINE-CVE-2025-6170",
+                                                                        "ALPINE-CVE-2025-62408",
+                                                                        "ALPINE-CVE-2025-64505",
+                                                                        "ALPINE-CVE-2025-64506",
+                                                                        "ALPINE-CVE-2025-64720",
+                                                                        "ALPINE-CVE-2025-65018",
+                                                                        "ALPINE-CVE-2025-66293",
+                                                                        "ALPINE-CVE-2025-8961",
+                                                                        "ALPINE-CVE-2025-9165",
+                                                                        "ALPINE-CVE-2026-22184",
+                                                                        "ALPINE-CVE-2026-22801",
+                                                                        "ALPINE-CVE-2026-25646",
+                                                                        "ALPINE-CVE-2026-27171",
+                                                                        "ALPINE-CVE-2026-33416",
+                                                                        "ALPINE-CVE-2026-33630",
+                                                                        "ALPINE-CVE-2026-33636",
+                                                                        "ALPINE-CVE-2026-34757",
+                                                                        "ALPINE-CVE-2026-40200",
+                                                                        "ALPINE-CVE-2026-4367",
+                                                                        "ALPINE-CVE-2026-6042",
+                                                                        "ALPINE-CVE-2026-6732"
+                                                                    ]
+                                                 },
+                      "zerotrust/orders-api":  {
+                                                   "image":  "docker.io/library/nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10",
+                                                   "packages":  68,
+                                                   "advisories":  [
+                                                                      "ALPINE-CVE-2024-58251",
+                                                                      "ALPINE-CVE-2025-10148",
+                                                                      "ALPINE-CVE-2025-46394",
+                                                                      "ALPINE-CVE-2025-4947",
+                                                                      "ALPINE-CVE-2025-49794",
+                                                                      "ALPINE-CVE-2025-49795",
+                                                                      "ALPINE-CVE-2025-49796",
+                                                                      "ALPINE-CVE-2025-5025",
+                                                                      "ALPINE-CVE-2025-6021",
+                                                                      "ALPINE-CVE-2025-6170",
+                                                                      "ALPINE-CVE-2025-62408",
+                                                                      "ALPINE-CVE-2025-64505",
+                                                                      "ALPINE-CVE-2025-64506",
+                                                                      "ALPINE-CVE-2025-64720",
+                                                                      "ALPINE-CVE-2025-65018",
+                                                                      "ALPINE-CVE-2025-66293",
+                                                                      "ALPINE-CVE-2025-8961",
+                                                                      "ALPINE-CVE-2025-9165",
+                                                                      "ALPINE-CVE-2026-22184",
+                                                                      "ALPINE-CVE-2026-22801",
+                                                                      "ALPINE-CVE-2026-25646",
+                                                                      "ALPINE-CVE-2026-27171",
+                                                                      "ALPINE-CVE-2026-33416",
+                                                                      "ALPINE-CVE-2026-33630",
+                                                                      "ALPINE-CVE-2026-33636",
+                                                                      "ALPINE-CVE-2026-34757",
+                                                                      "ALPINE-CVE-2026-40200",
+                                                                      "ALPINE-CVE-2026-4367",
+                                                                      "ALPINE-CVE-2026-6042",
+                                                                      "ALPINE-CVE-2026-6732"
+                                                                  ]
+                                               },
+                      "zerotrust/postgres":  {
+                                                 "image":  "docker.io/library/postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea",
+                                                 "packages":  45,
+                                                 "advisories":  [
+
+                                                                ]
+                                             },
+                      "zerotrust-build/build-runner":  {
+                                                           "image":  "docker.io/library/nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10",
+                                                           "packages":  68,
+                                                           "advisories":  [
+                                                                              "ALPINE-CVE-2024-58251",
+                                                                              "ALPINE-CVE-2025-10148",
+                                                                              "ALPINE-CVE-2025-46394",
+                                                                              "ALPINE-CVE-2025-4947",
+                                                                              "ALPINE-CVE-2025-49794",
+                                                                              "ALPINE-CVE-2025-49795",
+                                                                              "ALPINE-CVE-2025-49796",
+                                                                              "ALPINE-CVE-2025-5025",
+                                                                              "ALPINE-CVE-2025-6021",
+                                                                              "ALPINE-CVE-2025-6170",
+                                                                              "ALPINE-CVE-2025-62408",
+                                                                              "ALPINE-CVE-2025-64505",
+                                                                              "ALPINE-CVE-2025-64506",
+                                                                              "ALPINE-CVE-2025-64720",
+                                                                              "ALPINE-CVE-2025-65018",
+                                                                              "ALPINE-CVE-2025-66293",
+                                                                              "ALPINE-CVE-2025-8961",
+                                                                              "ALPINE-CVE-2025-9165",
+                                                                              "ALPINE-CVE-2026-22184",
+                                                                              "ALPINE-CVE-2026-22801",
+                                                                              "ALPINE-CVE-2026-25646",
+                                                                              "ALPINE-CVE-2026-27171",
+                                                                              "ALPINE-CVE-2026-33416",
+                                                                              "ALPINE-CVE-2026-33630",
+                                                                              "ALPINE-CVE-2026-33636",
+                                                                              "ALPINE-CVE-2026-34757",
+                                                                              "ALPINE-CVE-2026-40200",
+                                                                              "ALPINE-CVE-2026-4367",
+                                                                              "ALPINE-CVE-2026-6042",
+                                                                              "ALPINE-CVE-2026-6732"
+                                                                          ]
+                                                       },
+                      "zerotrust-observe/telemetry-agent":  {
+                                                                "image":  "docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc",
+                                                                "packages":  14,
+                                                                "advisories":  [
+
+                                                                               ]
+                                                            },
+                      "kube-system/kube-router":  {
+                                                      "image":  "docker.io/cloudnativelabs/kube-router@sha256:5215719695add13b2351688a1ca222c5a2f2f26b0f50d0fdbef2edabb9298632",
+                                                      "packages":  52,
+                                                      "advisories":  [
+                                                                         "ALPINE-CVE-2024-58251",
+                                                                         "ALPINE-CVE-2025-46394",
+                                                                         "ALPINE-CVE-2025-62408",
+                                                                         "ALPINE-CVE-2026-22184",
+                                                                         "ALPINE-CVE-2026-27171",
+                                                                         "ALPINE-CVE-2026-33630",
+                                                                         "ALPINE-CVE-2026-40200",
+                                                                         "ALPINE-CVE-2026-5545",
+                                                                         "ALPINE-CVE-2026-6042"
+                                                                     ]
+                                                  }
+                  }
+}
