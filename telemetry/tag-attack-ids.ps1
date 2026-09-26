@@ -371,7 +371,12 @@ foreach ($r in $SchemaRegistry) {
     $unjustifiedSamples = @()
 
     foreach ($e in $group) {
-        $techs = @(Get-ArrayOf (Get-Prop $e 'candidateTechniques') | Where-Object { $null -ne $_ })
+        # Get-ArrayOf already emits the array as a single object, so it must be
+        # used directly. Piping it into Where-Object hands the filter the array
+        # itself, and the extra @() re-wraps it, so the loop below would iterate
+        # once over a nested array and read .id off an array -- which has none.
+        # Every event then looks untagged. See the note on Get-ArrayOf.
+        $techs = Get-ArrayOf (Get-Prop $e 'candidateTechniques')
         $ids = @($techs | ForEach-Object { [string](Get-Prop $_ 'id') } | Where-Object { $_ })
 
         if ($ids.Count -gt 0) {
@@ -471,7 +476,7 @@ Write-Head 'technique ids'
 
 $emitted = @{}
 foreach ($e in $script:events) {
-    foreach ($t in @(Get-ArrayOf (Get-Prop $e 'candidateTechniques') | Where-Object { $null -ne $_ })) {
+    foreach ($t in (Get-ArrayOf (Get-Prop $e 'candidateTechniques'))) {
         $id = [string](Get-Prop $t 'id')
         if (-not $id) {
             # Array elements with no id are the shape bug this registry was built
