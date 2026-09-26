@@ -18,6 +18,13 @@
 #   anything      -> build       the build zone is not on any request path
 #   build-runner  -> zerotrust   see 34-networkpolicy-zones.yaml
 #
+# Verified by measurement (Phase 6). All five of those absences were read off the
+# live policies by graph/build-reachability.ps1 and then checked with real TCP
+# connections: every one came back dropped, no packet answered, 1000ms or more
+# each. The three paths that do exist were confirmed the same way. The list above
+# was previously a claim about the manifests; it is now a claim about the
+# datapath, which is the only kind worth making about containment.
+#
 # ---------------------------------------------------------------------------
 # A dead ingress allowance, found by tools/test-boundaries.ps1
 # ---------------------------------------------------------------------------

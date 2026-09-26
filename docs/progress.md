@@ -10,7 +10,7 @@ Phases are build order, not scope reduction. Each ends with something runnable.
 | 3 | Secrets and supply chain | **done** | secret sprawl and vulnerable images catalogued |
 | 4 | Privilege paths | **done** | each documented path is walkable by script |
 | 5 | Telemetry | **done** | audit, runtime, and network data tagged with ATT&CK IDs |
-| 6 | Correlation graph | not started | who-can-reach-what answers correctly |
+| 6 | Correlation graph | **done** | who-can-reach-what answers correctly |
 | 7 | Detections | not started | every rule fires against a real attack step |
 | 8 | Purple team | not started | full chain runs end to end, every step detected |
 | 9 | SOC console | not started | dashboard readable during a live attack |
@@ -372,6 +372,145 @@ same files would not.
 has happened. The registry reports that as *unexercised* rather than as a
 failure — a healthy cluster has no off-baseline token request — and the
 unexercised list is the Phase 7 work list. `T1090.001` is the same.
+
+## Phase 6 deliverables
+
+- `graph/build-reachability.ps1` — derives the who-can-reach-what graph from the
+  live NetworkPolicies, then proves it against the datapath
+- `graph/build-reachability.ps1 -SelfTest` — 34 fixtures for the decision logic,
+  no cluster required
+- `graph/test-reachability-selftest.ps1` — 9 mutations of the real script, each
+  of which must break the self-test
+- `graph/README.md` — the method, the traps, and what the graph deliberately
+  does not contain
+- `identities/34-networkpolicy-zones.yaml` — two overstated claims corrected by
+  measurement
+
+### The graph is 6 open and 19 blocked, and every one of the 25 is verified
+
+Not read off the policies. Each pair is checked with a real TCP connection from
+a probe pod carrying that identity's service account and the workload's own
+`app` label, dialling the destination Service's **ClusterIP** so the DNAT path is
+exercised rather than bypassed. Last run: **25 modelled, 25 confirmed, 0
+mismatches**, with the drop-versus-refuse classifier seen to separate 19 drops
+from 6 answers.
+
+Both drift directions are checked. A model that permits what the firewall drops
+invents access that does not exist; a model that denies what the firewall permits
+hides access that does. Verifying only the permitted edges would find the first
+kind and never the second.
+
+### A refused connection is not a blocked one, and `nc` cannot tell them apart
+
+`nc` failing means either the firewall dropped the SYN or the far end sent RST
+because nothing was listening. The second case arrived for real: the model says
+the sensor can reach itself on 8080, `telemetry-agent-ingress` admits its whole
+zone, the datapath agreed — and `netstat -lnt` inside the sensor returns **no
+sockets at all**, because it runs a probe loop and no server. The first version
+reported that as a policy violation that did not exist.
+
+busybox `nc -v` prints `open` on success and **nothing** on failure, so the
+reason had to come from elapsed time. Timing it from the host does not work:
+`kubectl exec` overhead alone measured 630 ms and `-w` does not move the figure
+at all, because the attempt ends when the kernel finishes its own SYN retry.
+Measuring from **inside** the pod, off `/proc/uptime`, gives two populations with
+an empty decade between them — 0–600 ms for anything that answered, 1000–2070 ms
+for every silent drop — with the cut at 600 ms. The exit code is tested first, so
+a slow success can never be mistaken for a drop. That ordering is what makes the
+margin safe rather than lucky, because the answered population is much less tidy
+than the failure one: a busier run answered a DNS control in 600 ms, which would
+be alarming if a slow success could be called a drop. It cannot, and the failure
+that has to be classified correctly is a refusal — a RST raised by the kernel on
+the far side, which network latency cannot stretch.
+
+### The positive control was not enough, and the reason matters
+
+Every probe must reach kube-dns on 53, which no lab policy governs, before its
+results are believed — per probe, not once per run. On the first run all five
+controls **passed** while all five app-specific edges came back blocked,
+including two that `tools/test-boundaries.ps1` independently asserts are open.
+
+A control that passes while the thing it guards is broken is worse than no
+control, because it buys false confidence. What it did do was move the fault
+from "connectivity" to "policy selection", which is what identified the cause:
+the probe was labelled `app: probe`, and NetworkPolicy selects pods by **label**,
+not by service account, so no app-specific rule selected it at all. The control
+did not catch the bug; it located it.
+
+### A probe is also a Service endpoint
+
+Having given the probe the workload's real `app` label, it inherits that
+workload's Service selector too — so a live probe is an endpoint of the very
+Service another probe may be about to call, and answers on a port where nothing
+listens. Probes are now created, measured and deleted one at a time.
+
+### Five silent bugs, all of which produced a confident wrong answer
+
+- **Agreement is not openness**, and this is the one no test caught. A pair the
+  model called *blocked* and the datapath *dropped* is an **agreement** — the
+  model was right — so it sat in the same set as a pair that genuinely
+  connected. Selecting edges on "did model and datapath agree" emitted **all 25
+  pairs as `kind: reachable`**, including the 19 the firewall had just refused.
+  The graph claimed twenty-five paths across a cluster that has six.
+
+  Nothing about the run looked wrong: `25/25 agree, 0 mismatches`, exit 0, every
+  comparison verified, classifier shown to be discriminating, both drift
+  directions checked. The wrong answer was in the `edges` array and nothing in
+  the run's own conclusions could see it, because the run was internally
+  consistent. Only reading the output found it. The script now states the
+  invariant — an edge exists for a modelled-open pair and for nothing else — and
+  checks it on every run in both directions: no edge without a modelled-open
+  pair, and no modelled-open pair without exactly one edge. Because that defect
+  agreed with itself, no amount of inspecting the run's own conclusions could
+  have surfaced it.
+- **A strict-mode property error is a warning, not a wall.** The first version of
+  that check reached for `$e.from` on a row that carries `source` and `dest`.
+  PowerShell raised `PropertyNotFoundStrict`, printed it, and **carried on to a
+  clean exit 0 with the graph written** — because
+  `$ErrorActionPreference = 'Stop'` does not apply inside a `Where-Object`
+  scriptblock.
+
+  Everything else in this file leans on `Set-StrictMode` to turn a missing
+  property into a hard stop. Inside a pipeline scriptblock it is not one, so the
+  assumption is wrong in exactly the places where checks live. Every check now
+  sets its own flag and reports it, and the final verdict is the AND of those
+  flags rather than the absence of an exception. This is the same lesson as the
+  vacuous-pass bug, arriving from a different direction: a check that reports
+  nothing has not passed.
+- **`policyTypes` casing.** One variable was used for both the capitalised enum
+  (`Ingress`) and the lower-case spec field (`ingress`). It matched nothing, so
+  no pod looked isolated and the model reported **25/25 open** with no error
+  raised. Worth recording precisely: PowerShell resolves `$obj.Ingress` and
+  `$obj.ingress` to the same property, so a case-only mutation is a no-op and
+  cannot be caught by any test. The mutation harness keeps that entry labelled
+  uncatchable rather than dropping it, because the bug was the *direction* being
+  conflated, and that one is caught.
+- **Namespace selector matched against the wrong map.** The peer check was given
+  the map of every namespace where it needed the labels of the peer's own
+  namespace. Type-compatible, so it ran, and it silently denied every cross-zone
+  rule — the three PP-02 observation edges simply vanished from the graph.
+- **An empty array is not an array.** `return @()` emits nothing, so the caller
+  got `$null` and `.Count` threw under `Set-StrictMode`. It failed only where the
+  answer was "nothing", which is to say only where nobody was looking.
+- **`endPort` was guessed at.** It now throws. No policy in this lab uses one.
+
+### A test suite that has never failed is not evidence
+
+`-SelfTest` runs the decision logic against 34 known-answer fixtures and touches
+no cluster. That is necessary and not sufficient: a suite whose subject was
+replaced by something that always agrees would also pass. So
+`test-reachability-selftest.ps1` takes the real script, reintroduces each bug
+above in a throwaway copy, and requires the self-test to notice — **9 mutations,
+9 caught**. It verifies each mutation's target text matched exactly once before
+running anything, because a mutation that silently matched nothing would report
+a pass for a test that never happened, and it separates a mutation caught by an
+assertion from one caught by a crash, since a suite that only ever dies is
+testing less than it appears to.
+
+It found a bug in itself on first run: the "did the file change" guard used `-eq`,
+which PowerShell evaluates case-insensitively, so a case-only mutation was
+reported as "no change" when the change had happened. Same casing confusion as
+the graph model, caught the same way — by a check that was looking.
 
 ## Findings so far
 

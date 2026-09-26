@@ -16,9 +16,24 @@
 #
 # Two properties keep this from being a hole:
 #   - its RBAC (identities/20-rbac.yaml) grants no write verb at all
-#   - nothing is permitted to reach it, so it cannot be used as a pivot
+#   - no other workload is permitted to reach it, so it cannot be used as a pivot
 # Broad read access plus no write access plus no inbound path is a defensible
 # combination. Broad read access plus writes would not be.
+#
+# Corrected by measurement (Phase 6): the second bullet was originally written
+# as "nothing is permitted to reach it", which is stronger than what the policies
+# actually say. telemetry-agent-ingress admits the entire observe zone, and the
+# sensor is in the observe zone, so the sensor is permitted to reach itself on
+# 8080. The datapath confirms it: the SYN is not dropped.
+#
+# The conclusion holds but the premise did not, and the distinction is worth
+# keeping. Reaching yourself is not a pivot. A pivot needs a second identity to
+# use, and the sensor holds no credential that opens anything -- its RBAC grants
+# no write verb, and the only thing behind its own port 8080 is itself, which
+# runs a shell probe loop and no server at all (netstat -lnt in that pod returns
+# no sockets). So the path exists and leads nowhere. Had the premise been left
+# standing, the graph would have contradicted the manifest and one of the two
+# would have had to be quietly discarded.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -100,6 +115,18 @@ spec:
 # telemetry-agent: inbound from the observe zone only. No workload in the lab is
 # permitted to reach the sensor, so observing the lab cannot become a stepping
 # stone into it.
+#
+# Note what "the observe zone" includes: the sensor itself. This rule is written
+# as a namespaceSelector with no podSelector, so it admits every pod in
+# zerotrust-observe, and that set has exactly one member. The consequence is the
+# self-edge measured in Phase 6 -- telemetry-agent -> telemetry-agent:8080 is
+# permitted, and nothing else is. It is left in place rather than excluded with a
+# podSelector, because excluding the sensor from its own ingress rule would buy
+# nothing: a pod cannot use itself as a stepping stone, and the narrower rule
+# would be harder to read and would need a comment explaining the exception.
+# The reachability graph records the edge as reachable with noListener set, so
+# the distinction between "permitted" and "actually serving" survives into the
+# output instead of being lost here.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
