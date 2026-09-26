@@ -15,33 +15,63 @@
 # So the containment in this file is real but partial, and the compensating
 # control in identities/20-rbac.yaml is the one that fails.
 #
-# Why it runs nginx
-# -----------------
-# A CI system exposes an HTTP endpoint that accepts build requests, so this is
-# not a web server bolted onto a CI runner for the sake of the lab. It is the
-# smallest honest stand-in for one: a listener, a health document, and a
-# long-lived process holding a service account token.
+# Why this image, and what replaced what
+# -------------------------------------
+# This pod used to run nginx, justified in a comment here as "a CI system
+# exposes an HTTP endpoint that accepts build requests". That claim is false.
+# Jenkins agents and GitLab Runner agents do not accept build submissions over
+# HTTP; the controller holds the API and the agent dials out to fetch work. A
+# web server on the runner was a fiction, and it cost the lab something real:
+# the workload could not fetch source, could not build anything, and so was not
+# a build runner at all. It was a web server with a cluster-admin token.
+#
+# docker:27-cli is the standard CI agent base image. It carries git 2.47.2 and
+# docker 27.5.1, so this pod can genuinely clone a repository and genuinely
+# run a container build. Both were confirmed by running them inside the image
+# rather than by trusting the image's documentation.
+#
+# The image is pinned by multi-arch index digest, consistent with every other
+# image in the lab. It is built on alpine 3.21, the same base as the nginx
+# image it replaces, so tools/scan-images.ps1 already has that ecosystem
+# calibrated and the 30 advisories reported against the old digest are expected
+# to be re-measured, not inherited.
+#
+# The listener is a measurement fixture, and is labelled as one
+# -----------------------------------------------------------
+# build-runner has no ingress at all: identities/34-networkpolicy-zones.yaml
+# denies it everything, and tools/test-boundaries.ps1 proves that by connecting
+# to port 8080 from three separate zones and requiring every attempt to fail.
+#
+# That assertion is only worth making if something is listening. A port with no
+# listener refuses the connection whether or not a NetworkPolicy exists, so
+# testing the policy against a silent pod produces a green result that measures
+# nothing whatsoever. The health endpoint below exists so that the ingress
+# policy has a real, live port to block.
+#
+# It is a fixture. It is not a claim about how CI systems are built, and the
+# previous comment in this file made exactly that claim. Keep the two apart.
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: build-runner-nginx-conf
+  name: build-runner-entrypoint
   namespace: zerotrust-build
 data:
-  default.conf: |
-    server {
-      listen 8080;
-      server_name _;
-
-      location = /health {
-        default_type application/json;
-        return 200 '{"status":"ready","identity":"sa-build-runner","privilege_path":"PP-01"}';
-      }
-
-      location / {
-        default_type application/json;
-        return 501 '{"error":"build submission not implemented in the lab"}';
-      }
-    }
+  runner.sh: |
+    # The CI agent's only long-lived process in this lab.
+    #
+    # A real agent blocks waiting for its controller to hand it a job. There is
+    # no controller here, so it idles. The listener below is not that wait: it
+    # exists so test-boundaries.ps1 has a live port to be refused on, and it
+    # answers with a canned document rather than doing any work.
+    #
+    # nc is busybox's, already present in this image. Nothing is installed at
+    # startup, because a container that installs things on boot is a container
+    # whose contents differ from its digest, which would defeat the pinning
+    # that makes this image reviewable at all.
+    while true; do
+      printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 72\r\nConnection: close\r\n\r\n{"status":"ready","identity":"sa-build-runner","privilege_path":"PP-01"}' \
+        | nc -l -p 8080
+    done
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -51,6 +81,9 @@ metadata:
   annotations:
     zerotrust.lab/privilege-path: PP-01
     zerotrust.lab/attack-id: T1078.001
+    zerotrust.lab/image-rationale: >-
+      Standard CI agent base image, verified to carry git 2.47.2 and docker
+      27.5.1. Replaces nginx, which could not fetch source or build anything.
 spec:
   replicas: 1
   selector:
@@ -66,6 +99,14 @@ spec:
       # NOT automountServiceAccountToken: false. The pod needs its token, and
       # that is the point: the escalation path is live, not theoretical.
       automountServiceAccountToken: true
+      # Hardened on every axis that is cheap, and it changes nothing. Non-root,
+      # read-only root filesystem, all capabilities dropped, default seccomp.
+      # PP-01 is unaffected by all four, because the token is handed to the pod
+      # by kubelet before the container's first instruction and the container
+      # has no say in it. That is the point worth taking from this workload: a
+      # pod can be correctly hardened and still be a total compromise, because
+      # the one permission that matters was granted to its identity rather than
+      # to its container.
       securityContext:
         runAsNonRoot: true
         runAsUser: 101
@@ -74,48 +115,34 @@ spec:
           type: RuntimeDefault
       containers:
         - name: runner
-          image: nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
-          # `daemon off;` only. See the note in 10-frontend-and-api.yaml: the
-          # `pid` directive already exists in the image's nginx.conf and passing
-          # it again via -g is a startup error.
-          args:
-            - nginx
-            - -g
-            - daemon off;
+          image: docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+          command: ["/bin/sh", "/runner/runner.sh"]
           ports:
             - containerPort: 8080
               name: http
           resources:
             requests:
               cpu: 10m
-              memory: 16Mi
+              memory: 24Mi
             limits:
               cpu: 200m
-              memory: 64Mi
+              memory: 96Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
-              add: ["CHOWN", "SETGID", "SETUID"]
           volumeMounts:
-            - name: conf
-              mountPath: /etc/nginx/conf.d
+            - name: entrypoint
+              mountPath: /runner
               readOnly: true
-            - name: cache
-              mountPath: /var/cache/nginx
-            - name: run
-              mountPath: /var/run
             - name: tmp
               mountPath: /tmp
       volumes:
-        - name: conf
+        - name: entrypoint
           configMap:
-            name: build-runner-nginx-conf
-        - name: cache
-          emptyDir: {}
-        - name: run
-          emptyDir: {}
+            name: build-runner-entrypoint
+            defaultMode: 0555
         - name: tmp
           emptyDir: {}
 ---

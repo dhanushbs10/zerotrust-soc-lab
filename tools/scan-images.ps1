@@ -581,7 +581,16 @@ foreach ($key in $savedWorkloads.PSObject.Properties.Name) {
     $now = $current[$key]
 
     if ($beforeImage -ne $now.image) {
-        $digestChanges.Add("$key`n      was $beforeImage`n      now $now.image")
+        # -f formatting, not string interpolation. This is not a style choice.
+        # PowerShell resolves `$now.image` correctly in an expression (so the
+        # -ne comparison above is sound), but inside a double-quoted string it
+        # stringifies the OrderedDictionary and appends the literal text
+        # ".image", printing:
+        #     now System.Collections.Specialized.OrderedDictionary.image
+        # The verdict was right and the explanation was nonsense, which is the
+        # worst combination for a drift report: it tells you the pinned image
+        # moved without telling you what it moved to.
+        $digestChanges.Add(("{0}`n      was {1}`n      now {2}" -f $key, $beforeImage, $now.image))
     }
     foreach ($id in $now.advisories) {
         if ($beforeIds -notcontains $id) { $newAdvisories.Add("$key  $id") }

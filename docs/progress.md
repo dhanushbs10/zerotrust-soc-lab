@@ -98,24 +98,28 @@ Three design decisions worth keeping:
 ### Verified, not assumed
 
 All four harnesses pass together: **33 boundary assertions, 10 drift findings,
-99 image advisories, 2 secret findings.**
+85 image advisories, 2 secret findings.**
 
-**99 advisory records across 6 images**, none of them simulated. Every number
+**85 advisory records across 6 images**, none of them simulated. Every number
 comes either from a file read out of a running container or from a response
 cached in `.telemetry/osv-cache/`.
 
 | image | distro | packages | advisories |
 |---|---|---|---|
-| `nginx:…65645c7b` — web-frontend, orders-api, build-runner | Alpine 3.21.3 | 68 | 30 |
+| `nginx:…65645c7b` — web-frontend, orders-api | Alpine 3.21.3 | 68 | 30 |
+| `docker:…851f91d2` — build-runner | Alpine 3.21.3 | 34 | 16 |
 | `kube-router:…5215719695` | Alpine 3.22.1 | 52 | 9 |
 | `postgres:…721873c3` | Alpine 3.24.2 | 45 | 0 |
 | `alpine:…d9e853e8` — telemetry-agent | Alpine 3.20.10 | 14 | 0 |
-| `nginx:…65645c7b` — orders-api (same digest) | Alpine 3.21.3 | 68 | 30 |
 
 The nginx digest is the worst of them, and its 30 advisories include
 `libpng` ×9, `libxml2` ×6, `curl` ×3, `busybox`, `c-ares`, `musl`, `tiff`,
 `zlib` and `libxpm`. kube-router's 9 include a `musl` advisory scoring
 `CVSS:3.1/AV:L/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:H`.
+
+`postgres` and `telemetry-agent` are clean against ecosystems calibrated to hold
+102 and 73 records for a single package respectively, so that clean is a
+measured result rather than an absence of data.
 
 **SP-01 is 2 findings, not 21.** One credential, fingerprint `A069F0C1482A91C8`,
 leaked twice: verbatim as `app-config-leak/DB_PASSWORD`, and embedded inside
@@ -136,14 +140,60 @@ from the baseline produced `9 NEW ADVISORY/ADVISORIES` and exit 1. For secrets: 
 file containing a live credential, added to the index, produced a CRITICAL
 finding and exit 1, and removing it returned exit 0.
 
-### Three things about the lab itself, found by building the tools
+The image drift check then proved itself on a real change rather than a
+synthetic one. Swapping `build-runner` off nginx produced
+`IMAGE DIGEST CHANGED`, 8 new advisories and 22 resolved, exit 1 — and the
+baseline was only regenerated after reading that diff.
 
-- **`build-runner` is nginx.** So is `orders-api`. The "CI runner" compiles
-  nothing and the "API" serves static content. PP-01 is unaffected, because the
-  attack execs in and uses the service-account token and busybox provides a
-  shell, but the build runner is a stand-in rather than a real job, and the
-  risk graph in Phase 7 will be drawing a more honest picture if that is called
-  out than if it is quietly presented as a CI pipeline.
+### The build-runner was nginx, and the justification for it was false
+
+`build-runner` ran nginx, and the comment in its manifest explained why:
+
+> A CI system exposes an HTTP endpoint that accepts build requests, so this is
+> not a web server bolted onto a CI runner for the sake of the lab.
+
+That is not how CI systems work. Jenkins and GitLab Runner **agents** do not
+accept build submissions over HTTP; the *controller* holds the API and the agent
+dials out to collect work. The lab asserted a fact about CI architecture to
+justify a stand-in, and the assertion was wrong, which made the stand-in
+unnecessary as well as dishonest.
+
+It now runs `docker:27-cli`, the standard CI agent base image, pinned to
+`sha256:851f91d2…`. Verified by running things inside it rather than by reading
+its documentation: `git 2.47.2` and `docker 27.5.1` are present, and the pod
+genuinely clones and builds. Its advisory count fell from 30 to 16 at the same
+time, and the lab total from 99 to 85.
+
+**PP-01 is completely unaffected, and that is the more interesting result.** The
+pod is hardened on every axis that is cheap — non-root UID 101, read-only root
+filesystem, all capabilities dropped, default seccomp — and it is still a total
+compromise of the cluster. The token is mounted into the pod by the kubelet
+before the container's first instruction, so the container has no say in it. A
+pod can be correctly hardened and still be fully owned, because the permission
+that matters was granted to its *identity* rather than to its *container*.
+
+**The listener stayed, but it is now labelled a fixture rather than an
+architecture claim.** `test-boundaries.ps1` connects to `build-runner:8080` from
+three zones and requires every attempt to fail. That assertion is worth nothing
+if nothing is listening: a closed port refuses connections whether or not a
+NetworkPolicy exists, so testing the policy against a silent pod returns green
+while measuring nothing. The health endpoint exists so the policy has a real
+port to block. It is served by busybox `nc` from inside the same image, nothing
+is installed at boot — a container that installs things on start has contents
+that differ from its digest, which defeats the pinning that makes the image
+reviewable — and the manifest now says plainly that this is a measurement
+fixture and not a claim about CI.
+
+### Remaining stand-in, deliberately not changed here
+
+`orders-api` is **still nginx**, serving static content. The manifest frames it
+as a deliberately hardened web workload and that framing is defensible, so
+changing it is a separate decision rather than something to fold into this
+commit. It is recorded here so the Phase 7 risk graph does not present it as a
+real API. The lab total of 85 advisories includes its 30.
+
+### Two more things about the lab itself
+
 - **The CNI is the second most vulnerable image in the lab.** 9 advisories,
   including the serious `musl` one. It runs with host networking and privileges
   that no application pod has, which is the usual shape of CNI risk and is worth
@@ -236,11 +286,30 @@ finding and exit 1, and removing it returned exit 0.
   correlate two copies of one password and useless to anyone who wants the
   password. Two copies of the same credential share a fingerprint, so "how far
   has this spread" is answerable without handling the value.
+- **PowerShell resolves `$obj.prop` differently in a comparison than in a
+  string.** `$now.image -ne $before` is correct against an `[ordered]@{}`
+  entry, because the comparison operators resolve the key. But `"$now.image"`
+  inside a double-quoted string stringifies the `OrderedDictionary` and appends
+  the literal text `.image`, printing
+  `now System.Collections.Specialized.OrderedDictionary.image`. The drift
+  verdict was right and its explanation was nonsense, which is the worst
+  combination a drift report can have: it announces that the pinned image moved
+  without saying what it moved to. All such messages use `-f` formatting now.
+- **A boundary test against a closed port measures nothing.** `test-boundaries.ps1`
+  proves the build zone denies ingress by connecting to `build-runner:8080` from
+  three zones and requiring failure. With nginx removed and nothing listening,
+  those assertions would still pass — a closed port refuses connections whether
+  or not a NetworkPolicy exists. This is why replacing the build-runner's image
+  required keeping a real listener rather than treating one as an nginx
+  leftover, and why the manifest calls that listener a fixture. A green test
+  that cannot fail for the reason it claims to be testing is worse than no test.
 - **`Set-Content -Encoding utf8` under Windows PowerShell 5.1 emits CRLF and a
   BOM.** The `mixed-line-ending` pre-commit hook then rewrites the file and fails
   the commit, so every regenerated baseline produced a spurious hook failure and
   a dirty diff. All three scanners share a `Write-JsonFile` helper that writes LF
-  with no BOM and is verified byte-stable.
+  with no BOM and is verified byte-stable. The same CRLF hazard applies to shell
+  scripts handed to busybox: a here-string written on Windows produces a script
+  that dies with `syntax error: unexpected end of file (expecting "fi")`.
 
 ## Open decisions
 
