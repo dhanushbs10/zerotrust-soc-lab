@@ -1,467 +1,52 @@
-/* ZeroTrust SOC console -- client
-   ------------------------------------------------------------------
-   No framework, no build step, no npm. The project has deliberately avoided
-   a Node toolchain so far and there is no reason a status page should be the
-   thing that introduces one.
-
-   Everything renders from the read APIs; the control panel POSTs to the
-   action allowlist and polls the job. Nothing here computes a verdict the
-   server did not compute -- in particular the "uncovered" panel is exactly
-   what /api/summary reports, and this file does not try to be cleverer than
-   the thing it is displaying. */
-
 'use strict';
 
-const $ = (sel, root = document) => root.querySelector(sel);
-const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const S = { jobs: new Map(), running: false, tick: 0, refresh: null, rules: [], coverage: null, chain: null, events: [], artifacts: {}, technique: '', streamCacheKey: '', streamLoading: false, actions: {} };
+const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[c]);
+const fmt = n => Number(n || 0).toLocaleString('en-US');
+const age = n => n == null ? 'Ã¢â‚¬â€' : n < 60 ? `${Math.round(n)}s` : n < 3600 ? `${Math.round(n / 60)}m` : n < 86400 ? `${Math.round(n / 3600)}h` : `${Math.round(n / 86400)}d`;
+const bytes = n => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+const techniqueId = x => typeof x === 'string' ? x : x?.id;
+const techMap = () => new Map((S.coverage?.knownTechniques || []).map(x => [x.id, x.name]));
+const techName = id => techMap().get(id) || (id === 'T1078.001' ? 'Valid Accounts: Default Accounts' : 'Technique details unavailable');
+const techLink = id => `<button class="tech-link" data-tech="${esc(id)}"><span>${esc(id)}</span><em>${esc(techName(id))}</em></button>`;
 
-const state = {
-  rules: [],
-  selectedRule: null,
-  jobs: new Map(),
-  pollTimer: null,
-};
-
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
-  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-));
-
-function toast(msg, bad = false) {
-  const el = $('#toast');
-  el.textContent = msg;
-  el.classList.toggle('is-bad', bad);
-  el.classList.add('is-on');
-  clearTimeout(el._t);
-  el._t = setTimeout(() => el.classList.remove('is-on'), 4200);
-}
-
-async function api(path, opts) {
-  const res = await fetch(path, opts);
-  let body = null;
-  try { body = await res.json(); } catch { /* empty or non-JSON */ }
-  return { status: res.status, ok: res.ok, body };
-}
-
-const ago = (secs) => {
-  if (secs == null) return '—';
-  if (secs < 60) return `${Math.round(secs)}s`;
-  if (secs < 3600) return `${Math.round(secs / 60)}m`;
-  if (secs < 86400) return `${Math.round(secs / 3600)}h`;
-  return `${Math.round(secs / 86400)}d`;
-};
-
-const bytes = (n) => {
-  if (n == null) return '—';
-  if (n < 1024) return `${n} B`;
-  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1048576).toFixed(1)} MB`;
-};
-
-/* ── tabs ─────────────────────────────────────────────────── */
-
-$$('.tab').forEach((tab) => {
-  tab.addEventListener('click', () => {
-    $$('.tab').forEach((t) => t.classList.toggle('is-active', t === tab));
-    $$('.view').forEach((v) => v.classList.toggle('is-active', v.dataset.view === tab.dataset.view));
-    if (tab.dataset.view === 'detections' && !state.rules.length) loadDetections();
-    if (tab.dataset.view === 'graph') loadGraph();
-    if (tab.dataset.view === 'chain') loadChain();
-    if (tab.dataset.view === 'stream') loadStream();
-    if (tab.dataset.view === 'control') loadActions();
-  });
-});
-
-/* ── health + overview ─────────────────────────────────────── */
-
-async function loadHealth() {
-  const { body } = await api('/api/health');
-  if (!body) return;
-  const pill = $('#cluster-pill');
-  const ready = body.cluster === 'ready';
-  pill.textContent = `cluster ${body.cluster}`;
-  pill.className = `pill ${ready ? 'pill-ok' : 'pill-bad'}`;
-
-  const files = Object.entries(body.artifacts || {})
-    .sort((a, b) => b[1].ageSeconds - a[1].ageSeconds);
-  const oldest = files.length ? Math.max(...files.map((f) => f[1].ageSeconds)) : null;
-
-  $('#stamp').textContent = `refreshed ${new Date().toLocaleTimeString()}`;
-
-  const tb = $('#artifacts tbody');
-  if (!files.length) {
-    tb.innerHTML = '<tr><td colspan="3" class="empty">no artifacts yet — run a collection from Control</td></tr>';
-    return;
-  }
-  tb.innerHTML = files.map(([name, info]) => {
-    const stale = info.ageSeconds > 3600;
-    return `<tr>
-      <td class="mono">${esc(name)}</td>
-      <td class="num dim">${bytes(info.bytes)}</td>
-      <td class="num ${stale ? 'hit-0' : 'dim'}">${ago(info.ageSeconds)}</td>
-    </tr>`;
-  }).join('');
-
-  if (oldest != null && oldest > 3600) {
-    toast(`oldest artifact is ${ago(oldest)} old`, true);
-  }
-}
-
-async function loadOverview() {
-  const { body } = await api('/api/summary');
-  if (!body) return;
-
-  // Privilege paths
-  const w = body.walks || {};
-  const setTile = (key, value, note, status) => {
-    $(`#t-${key}`).textContent = value;
-    $(`#tn-${key}`).textContent = note;
-    $(`.tile[data-k="${key === 'detect' ? 'detect' : key}"]`)?.setAttribute('data-s', status);
-  };
-  if (w.paths) {
-    const held = w.held ?? 0;
-    const failed = w.failed ?? 0;
-    setTile('walks', `${held}/${held + failed}`,
-      `${w.paths} paths · ${(w.attackIds || []).length} techniques`,
-      failed ? 'bad' : 'ok');
-  } else {
-    setTile('walks', '—', 'no sweep recorded', 'warn');
-  }
-
-  // Chain
-  const c = body.chain || {};
-  if (c.run) {
-    const undet = (c.undetectable || []).length;
-    setTile('chain', `${c.succeeded}/${(c.succeeded || 0) + (c.failed || 0)}`,
-      undet ? `${undet} hop(s) undetectable` : 'every hop has a rule',
-      c.failed ? 'bad' : undet ? 'warn' : 'ok');
-  } else {
-    setTile('chain', '—', 'no chain recorded', 'warn');
-  }
-
-  // Detections
-  setTile('detect', '…', 'loading rules', 'warn');
-  const det = await api('/api/detections');
-  if (det.body && det.body.rules) {
-    const rules = det.body.rules;
-    const total = rules.reduce((a, r) => a + (r.hits || 0), 0);
-    const dead = rules.filter((r) => (r.hits || 0) === 0).length;
-    setTile('detect', String(rules.length),
-      dead ? `${dead} rule(s) matched nothing` : `${total} event(s) matched`,
-      dead ? 'bad' : 'ok');
-  }
-
-  // Graph
-  const g = body.graph || {};
-  if (g.edges != null) {
-    setTile('graph', String(g.edges), `${g.nodes ?? '?'} nodes modelled`, 'ok');
-  } else {
-    setTile('graph', '—', 'no graph recorded', 'warn');
-  }
-
-  renderGaps(c);
-  loadCoverage();
-}
-
-function renderGaps(chain) {
-  const host = $('#gaps');
-  const undet = chain?.undetectable || [];
-  if (!undet.length) { host.innerHTML = ''; return; }
-  host.innerHTML = undet.map((t) => `
-    <div class="gap">
-      <div class="gap-t">${esc(t)}</div>
-      <div class="gap-d">No collected schema carries this technique, so no rule can
-        fire on the behaviour. The hop still ran. This is a gap in what the lab
-        collects, not in the rules.</div>
-    </div>`).join('');
-}
-
-async function loadCoverage() {
-  const { body } = await api('/api/attack-coverage');
-  const host = $('#coverage');
-  if (!body || body._missing) { host.innerHTML = '<p class="empty">no coverage report</p>'; return; }
-
-  const rows = body.schemas || body.coverage || [];
-  if (!Array.isArray(rows) || !rows.length) {
-    host.innerHTML = '<p class="empty">coverage report has no per-schema rows</p>';
-    return;
-  }
-  const max = Math.max(...rows.map((r) => r.observed || 0), 1);
-  host.innerHTML = rows.map((r) => {
-    const n = r.observed || 0;
-    const pct = Math.round((n / max) * 100);
-    const tech = (r.techniques || []).map((t) => `<span class="chip chip-t">${esc(t)}</span>`).join('');
-    return `<div class="cov" title="${esc(r.schema)}">
-      <span class="cov-id">${esc((r.techniques || [])[0] || r.schema.split('/')[1] || '')}</span>
-      <span><span class="cov-bar"><span class="cov-fill ${n ? '' : 'zero'}" style="width:${pct}%"></span></span>
-        <span class="dim mono" style="font-size:11px">${esc(r.schema)}</span></span>
-      <span class="cov-n">${n}</span>
-    </div>${tech ? '' : ''}`;
-  }).join('');
-}
-
-/* ── detections ───────────────────────────────────────────── */
-
-async function loadDetections() {
-  const { body } = await api('/api/detections');
-  if (!body) return;
-  state.rules = body.rules || [];
-
-  const tb = $('#rules tbody');
-  if (!state.rules.length) {
-    tb.innerHTML = '<tr><td colspan="4" class="empty">no rules found</td></tr>';
-    return;
-  }
-  tb.innerHTML = state.rules.map((r, i) => {
-    if (r._broken) {
-      return `<tr><td class="mono">${esc(r._broken)}</td>
-        <td colspan="3" class="dim">failed to load: ${esc(r._error)}</td></tr>`;
-    }
-    const tech = (r.techniques || []).map((t) => `<span class="chip chip-t">${esc(t)}</span>`).join('');
-    const cls = r.hits === 0 ? 'hit-0' : r.hits < 20 ? 'hit-lo' : 'hit-hi';
-    return `<tr data-i="${i}">
-      <td>${esc(r.title)}<div class="dim mono" style="font-size:11px">${esc(r.id || '')}</div></td>
-      <td>${tech}</td>
-      <td class="num"><span class="hit ${cls}">${r.hits}</span></td>
-      <td class="mono dim" style="font-size:11px">${esc(r.schema || '')}</td>
-    </tr>`;
-  }).join('');
-
-  $$('#rules tbody tr').forEach((tr) => tr.addEventListener('click', () => {
-    $$('#rules tbody tr').forEach((x) => x.classList.remove('is-sel'));
-    tr.classList.add('is-sel');
-    showSamples(Number(tr.dataset.i));
-  }));
-
-  if (state.rules.length) showSamples(0);
-}
-
-function showSamples(i) {
-  const r = state.rules[i];
-  const host = $('#samples');
-  if (!r || !r.sample || !r.sample.length) {
-    host.innerHTML = '<p class="empty">this rule matched nothing, so there is nothing to show</p>';
-    return;
-  }
-  host.innerHTML = r.sample.map((s) => `
-    <div style="padding:8px 0;border-bottom:1px solid var(--line-soft)">
-      <div class="mono dim" style="font-size:11px">${esc(s.collectedAt || '')}</div>
-      <div class="mono" style="font-size:12px;margin-top:2px">${esc(s.summary || '')}</div>
-      <div style="margin-top:3px">${(s.techniqueIds || []).map((t) => `<span class="chip">${esc(t)}</span>`).join('')}</div>
-    </div>`).join('');
-}
-
-/* ── graph ────────────────────────────────────────────────── */
-
-async function loadGraph() {
-  const { body } = await api('/api/graph');
-  const host = $('#graph');
-  if (!body || body._missing) { host.innerHTML = '<p class="empty">no reachability graph recorded</p>'; return; }
-
-  const edges = body.edges || [];
-  if (!edges.length) { host.innerHTML = '<p class="empty">graph has no edges</p>'; return; }
-
-  // Sort open first: the interesting pairs are the ones an attacker would use.
-  const rank = (e) => (e.observed === 'open' ? 0 : e.noListener ? 1 : 2);
-  const sorted = edges.slice().sort((a, b) => rank(a) - rank(b));
-
-  host.innerHTML = sorted.map((e) => {
-    const open = e.observed === 'open';
-    const cls = open ? 'open' : e.noListener ? 'nolistener' : '';
-    const verdict = open ? 'open' : e.noListener ? 'no listener' : 'blocked';
-    const vcls = open ? 'open' : e.noListener ? 'nolistener' : 'closed';
-    return `<div class="g-edge ${cls}">
-      <span class="g-from">${esc(e.from)}</span>
-      <span class="g-arrow">── ${esc(e.port)} ──▶</span>
-      <span class="g-to">${esc(e.to)}</span>
-      <span class="g-verdict ${vcls}">${verdict}${e.elapsedMs != null ? ` ${e.elapsedMs}ms` : ''}</span>
-      ${e.decidedBy ? `<span class="g-policies">decided by ${esc((e.decidedBy || []).join(', '))}</span>` : ''}
-    </div>`;
-  }).join('');
-}
-
-/* ── chain ────────────────────────────────────────────────── */
-
-async function loadChain() {
-  const { body } = await api('/api/chain');
-  const host = $('#chain');
-  if (!body || body._missing) { host.innerHTML = '<p class="empty">no chain recorded — run it from Control</p>'; return; }
-
-  const undet = new Set(body.undetectable || []);
-  const hops = body.hops || [];
-  if (!hops.length) { host.innerHTML = '<p class="empty">chain recorded no hops</p>'; return; }
-
-  host.innerHTML = hops.map((h) => {
-    const noRule = undet.has(h.attackId);
-    const verdict = noRule ? 'no rule' : 'rule fires';
-    const vcls = noRule ? 'none' : 'ok';
-    return `<div class="hop">
-      <span class="hop-id">${esc(h.id)}</span>
-      <span class="hop-tech">${esc(h.attackId)}</span>
-      <span class="hop-verdict ${vcls}">${verdict}</span>
-      <span>
-        <span class="hop-what">${esc(h.what)}</span>
-        <span class="hop-detail">${esc(h.detail || '')}</span>
-      </span>
-    </div>`;
-  }).join('') + `
-    <p class="lede" style="margin-top:14px">
-      Chain ${esc(body.chainRun)} &middot; ${body.hopsSucceeded} of
-      ${(body.hopsSucceeded || 0) + (body.hopsFailed || 0)} hops succeeded.
-      ${undet.size
-        ? `<strong>${undet.size} hop has no rule at all</strong>, so the chain is not fully detected and the report does not claim it is.`
-        : 'Every hop has a rule.'}
-    </p>`;
-}
-
-/* ── stream ───────────────────────────────────────────────── */
-
-async function loadStream() {
-  const schema = $('#schema-filter').value;
-  const limit = $('#limit-filter').value;
-  const host = $('#stream');
-  host.innerHTML = '<p class="empty">loading…</p>';
-  const { body } = await api(`/api/telemetry?limit=${encodeURIComponent(limit)}${schema ? `&schema=${encodeURIComponent(schema)}` : ''}`);
-  if (!body || !body.events) { host.innerHTML = '<p class="empty">no events</p>'; return; }
-
-  if (!body.events.length) {
-    host.innerHTML = '<p class="empty">no events match that filter</p>';
-    return;
-  }
-  host.innerHTML = body.events.map((e) => `
-    <div class="ev">
-      <span class="ev-t">${esc((e.collectedAt || '').replace('T', ' ').slice(0, 19))}</span>
-      <span class="ev-s">${esc(e.schema || '')}</span>
-      <span class="ev-d">${summarise(e)}</span>
-    </div>`).join('');
-}
-
-/* Returns HTML, and escapes every value it interpolates itself.
-   The caller must NOT escape the result: doing both escapes the <b> tags too and
-   the stream rendered literal markup, which is exactly the sort of thing that
-   looks like a data problem and is a rendering one. Values come from telemetry
-   and are untrusted, so the escaping belongs here, next to the interpolation --
-   not at some outer layer that this function's author cannot see. */
-function summarise(e) {
-  switch (e.schema) {
-    case 'runtime/container-exec/v1': {
-      const t = e.target || {}; const i = e.identity || {};
-      const cmd = (e.commandLine || '').slice(0, 90);
-      return `<b>${esc(i.effectiveIdentity || '?')}</b> ${esc(e.subresource || '')} → ${esc(t.namespace)}/${esc(t.pod)} · ${esc(cmd)}`;
-    }
-    case 'runtime/token-request/v1':
-      return `<b>${esc(e.namespace)}/${esc(e.serviceAccount)}</b> requester=${esc(e.requesterClass)} code=${esc(e.responseCode)}`;
-    case 'runtime/pod-log-read/v1':
-      return `<b>${esc((e.identity || {}).effectiveIdentity)}</b> read ${esc(e.namespace)}/${esc(e.pod)}`;
-    case 'network/denial-counter/v1': {
-      const s = e.subject || {}; const c = e.counter || {};
-      return `<b>${esc(s.namespace)}/${esc(s.pod)}</b> +${esc(c.deltaDenied)} denied of +${esc(c.deltaTotal)} (${esc(e.baselineState)})`;
-    }
-    case 'network/observed-flow/v1': {
-      const s = e.source || {};
-      return `<b>${esc(s.name || '?')}</b> → ${esc(e.dest)}:${esc(e.destPort)} [${esc(e.scope)}/${esc(e.state)}]`;
-    }
-    case 'runtime/workload-identity/v1':
-      return `<b>${esc(e.namespace)}/${esc(e.pod)}</b> as ${esc(e.serviceAccount)}`;
-    default:
-      return esc(JSON.stringify(e).slice(0, 120));
-  }
-}
-
-$('#schema-filter').addEventListener('change', loadStream);
-$('#limit-filter').addEventListener('change', loadStream);
-$('#reload-stream').addEventListener('click', loadStream);
-
-/* ── control ──────────────────────────────────────────────── */
-
-async function loadActions() {
-  const { body } = await api('/api/actions');
-  const host = $('#actions');
-  if (!body) { host.innerHTML = '<p class="empty">could not load actions</p>'; return; }
-
-  host.innerHTML = Object.entries(body).map(([name, spec]) => `
-    <button class="act" data-a="${esc(name)}" data-m="${spec.mutating ? '1' : '0'}">
-      <span class="act-n">${esc(name)}</span>
-      <span class="act-d">${esc(spec.about)}</span>
-      ${spec.mutating ? '<span class="act-m">changes cluster state</span>' : ''}
-    </button>`).join('');
-
-  $$('#actions .act').forEach((btn) => btn.addEventListener('click', () => runAction(btn)));
-}
-
-async function runAction(btn) {
-  const name = btn.dataset.a;
-  const mutating = btn.dataset.m === '1';
-
-  if (mutating) {
-    // The server requires ?confirm=yes. A browser confirm() is the second half of
-    // that: the flag is the control, and this is the human-facing part of it.
-    const okToRun = window.confirm(
-      `"${name}" changes cluster state.\n\n` +
-      'For `chain` this creates a pod in the business zone and mints a ' +
-      'cluster-admin token.\n\nRun it?'
-    );
-    if (!okToRun) return;
-  }
-
-  const url = `/api/action/${encodeURIComponent(name)}${mutating ? '?confirm=yes' : ''}`;
-  btn.disabled = true;
-  const { status, body } = await api(url, { method: 'POST' });
-  btn.disabled = false;
-
-  if (status === 202 && body?.job) {
-    state.jobs.set(body.job.id, body.job);
-    renderJobs();
-    toast(`${name} started`);
-    pollJobs();
-  } else {
-    toast(body?.error || `${name} refused (${status})`, true);
-  }
-}
-
-function renderJobs() {
-  const host = $('#jobs');
-  if (!state.jobs.size) { host.innerHTML = '<p class="empty">no jobs yet</p>'; return; }
-  host.innerHTML = Array.from(state.jobs.values())
-    .sort((a, b) => b.elapsedSeconds - a.elapsedSeconds)
-    .map((j) => `
-      <div class="job">
-        <div class="job-h">
-          <span class="job-n">${esc(j.name)}</span>
-          <span class="job-s ${esc(j.state)}">${esc(j.state)}</span>
-          <span class="job-t">${esc(j.exitCode == null ? '' : `exit ${j.exitCode} · `)}${j.elapsedSeconds}s</span>
-        </div>
-        <pre class="job-o">${esc((j.output || []).join('\n') || '(no output yet)')}</pre>
-      </div>`).join('');
-}
-
-async function pollJobs() {
-  if (state.pollTimer) return;
-  const tick = async () => {
-    let running = false;
-    for (const [id, job] of state.jobs) {
-      if (job.state === 'running') {
-        const { body } = await api(`/api/job/${id}`);
-        if (body?.job) {
-          state.jobs.set(id, body.job);
-          if (body.job.state === 'running') running = true;
-        }
-      }
-    }
-    renderJobs();
-    if (!running) {
-      state.pollTimer = null;
-      // Results changed on disk, so the read views are now stale.
-      loadHealth(); loadOverview(); loadGraph(); loadChain();
-      toast('jobs finished — views refreshed');
-      return;
-    }
-    state.pollTimer = setTimeout(tick, 1500);
-  };
-  state.pollTimer = setTimeout(tick, 800);
-}
-
-/* ── boot ─────────────────────────────────────────────────── */
-
-loadHealth();
-loadOverview();
-setInterval(loadHealth, 15000);
+async function api(path, opts) { try { const r = await fetch(path, opts); let body = null; try { body = await r.json(); } catch {} return { ok:r.ok, status:r.status, body }; } catch (e) { return { ok:false, body:null, error:e }; } }
+function toast(msg, bad=false) { const t=$('#toast'); t.textContent=msg; t.classList.toggle('bad',bad); t.classList.add('on'); clearTimeout(t._timer); t._timer=setTimeout(()=>t.classList.remove('on'),3500); }
+function go(view) { $$('.view').forEach(v=>v.classList.toggle('active',v.dataset.view===view)); $$('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.view===view)); history.replaceState(null,'',`#${view}`); if(view==='stream') loadStream(); if(view==='control') loadActions(); }
+$$('.nav-item').forEach(b=>b.addEventListener('click',()=>go(b.dataset.view)));
+$$('[data-go]').forEach(b=>b.addEventListener('click',()=>go(b.dataset.go)));
+document.addEventListener('click',e=>{const b=e.target.closest('[data-tech]'); if(b){setTechnique(b.dataset.tech); if($('.view.active')?.dataset.view!=='detections') go('detections');}});
+function setTechnique(id) { S.technique=id||''; const d=$('#technique-filter'), s=$('#stream-technique'); if(d)d.value=S.technique; if(s)s.value=S.technique; renderRules(); if($('.view.active')?.dataset.view==='stream') loadStream(); }
+function populateTechniques() { const ts=new Map(); (S.coverage?.knownTechniques||[]).forEach(t=>ts.set(t.id,t.name)); (S.rules||[]).forEach(r=>(r.techniques||[]).forEach(t=>{if(!ts.has(t))ts.set(t,techName(t));})); if(S.chain?.undetectable) S.chain.undetectable.forEach(t=>{if(!ts.has(t))ts.set(t,techName(t));}); const opt=[...ts].sort((a,b)=>a[0].localeCompare(b[0])).map(([id,name])=>`<option value="${esc(id)}">${esc(id)} Ã‚Â· ${esc(name)}</option>`).join(''); for(const id of ['technique-filter','stream-technique']) { const el=$(`#${id}`); if(el){ const selected=el.value||S.technique; el.innerHTML='<option value="">All techniques</option>'+opt; el.value=selected; } } }
+async function refreshAll(live=false) { const [h,s,d,c,g,t,e] = await Promise.all([api('/api/health'),api('/api/summary'),api('/api/detections'),api('/api/attack-coverage'),api('/api/graph'),api('/api/chain'),api('/api/telemetry?limit=35')]); if(h.body){S.artifacts=h.body.artifacts||{}; renderHealth(h.body);} if(s.body)renderSummary(s.body); if(d.body){S.rules=d.body.rules||[]; $('#detection-total').textContent=`${fmt(d.body.eventsConsidered)} EVENTS CONSIDERED`; renderRules();} if(c.body&&!c.body._missing){S.coverage=c.body;renderCoverage(c.body);} if(g.body&&!g.body._missing){renderGraph(g.body);window.SentinelGraph&&window.SentinelGraph.onRefresh(g.body);} if(t.body&&!t.body._missing){S.chain=t.body;renderChain(t.body);} if(e.body?.events){S.events=e.body.events;renderRecent(S.events); if($('.view.active')?.dataset.view==='stream')renderStream();} populateTechniques(); if(live){window.SentinelGraph&&window.SentinelGraph.setLive(true);tickJobs();} }
+function renderHealth(h) { const ready=h.cluster==='ready', pill=$('#cluster-pill'); pill.classList.toggle('up',ready); pill.innerHTML=`<i></i><span>${esc(h.cluster||'UNKNOWN').toUpperCase()}</span>`; $('#stamp').textContent=`Updated ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`; const rows=Object.entries(h.artifacts||{}).sort((a,b)=>a[1].ageSeconds-b[1].ageSeconds); $('#artifacts').innerHTML=rows.length?rows.map(([n,v])=>{const fresh=v.ageSeconds<300,medium=v.ageSeconds<3600;return `<article class="artifact"><span class="artifact-dot ${fresh?'fresh':medium?'warm':'stale'}"></span><div class="artifact-info"><strong>${esc(n)}</strong><span>${bytes(v.bytes)} <i>Ã‚Â·</i> ${age(v.ageSeconds)} ago</span></div><span class="artifact-state ${fresh?'fresh':medium?'warm':'stale'}">${fresh?'FRESH':medium?'AGING':'STALE'}</span></article>`}).join(''):'<p class="empty-state">No artifacts available. Run a collection from Control.</p>'; }
+function renderSummary(x) {const w=x.walks||{},c=x.chain||{},g=x.graph||{},d=x.detections||{}; $('#m-walks').textContent=w.held!=null?`${w.held}/${Number(w.held)+Number(w.failed||0)}`:'Ã¢â‚¬â€'; $('#mn-walks').textContent=w.paths!=null?`${w.paths} paths Ã‚Â· ${w.failed||0} failed Ã‚Â· walk-summary.json ${w.at?`Ã‚Â· ${new Date(w.at).toLocaleString()}`:''}`:'No sweep recorded'; $('#m-chain').textContent=c.succeeded!=null?`${c.succeeded}/${Number(c.succeeded)+Number(c.failed||0)}`:'Ã¢â‚¬â€'; $('#mn-chain').textContent=c.run?`${(c.undetectable||[]).length} undetectable Ã‚Â· chain-summary.json Ã‚Â· ${c.run}`:'No chain recorded'; const count=S.rules.length||d.rules||d.ruleCount; $('#m-detections').textContent=count!=null?String(count):'Ã¢â‚¬â€'; $('#mn-detections').textContent=count!=null?`${S.rules.reduce((a,r)=>a+Number(r.hits||0),0).toLocaleString()} matched events Ã‚Â· detection rules`:'Awaiting report'; $('#m-graph').textContent=g.edges!=null?String(g.edges):'Ã¢â‚¬â€'; $('#mn-graph').textContent=g.edges!=null?`${g.nodes} nodes Ã‚Â· reachability-graph.json`:'No graph recorded'; renderGaps(c); }
+function renderGaps(c) {const list=c.undetectable||[]; $('#gaps').innerHTML=list.length?list.map(id=>`<div class="gap-item"><span class="gap-icon">!</span><div>${techLink(id)}<p>No collected schema carries this technique; no rule can match the behavior.</p></div><span class="gap-label">NO RULE</span></div>`).join(''):'<div class="gap-clear"><span>Ã¢Å“â€œ</span><div><strong>No known chain gap</strong><small>Check the chain report; an empty unmapped list is not a full coverage claim.</small></div></div>'; }
+function renderCoverage(c) {const rows=c.coverage||[]; if(!rows.length){$('#coverage').innerHTML='<p class="empty-state">No per-schema coverage data.</p>';return;} $('#coverage').innerHTML=rows.map(r=>{const n=Number(r.observed||0),tag=Number(r.tagged||0),pct=n?Math.min(100,tag/n*100):0,kind=r.coverage||'inventory';return `<div class="coverage-row"><div class="coverage-label"><span>${esc(r.schema||r.name)}</span><span class="coverage-badge ${esc(kind)}">${esc(kind)}</span></div><div class="coverage-track"><span style="width:${pct}%"></span></div><div class="coverage-stats"><strong>${fmt(tag)} <i>/</i> ${fmt(n)}</strong><span>${pct.toFixed(1)}% tagged</span></div></div>`}).join(''); const exclusion=c.phase7Exclusions; const note=typeof exclusion==='string'?exclusion:Object.values(exclusion||{}).find(x=>typeof x==='string'); if(note)$('#coverage').insertAdjacentHTML('beforeend',`<p class="coverage-caveat">${esc(note)}</p>`); }
+function renderRecent(events) {const host=$('#recent-events'); host.innerHTML=events.length?events.slice(0,6).map(eventHTML).join(''):'<p class="empty-state">No events yet.</p>'; }
+function eventTime(e){return e.collectedAt||e.timestamp||e.firstSeen||'';}
+function eventTech(e){return (e.candidateTechniques||[]).map(techniqueId).filter(Boolean);}
+function redactMark(str){const safe=esc(str||'');return safe.includes('&lt;redacted&gt;')?safe.replaceAll('&lt;redacted&gt;','<span class="redacted">&lt;redacted&gt; <i>WITHHELD</i></span>'):safe;}
+function eventHTML(e) {const schema=e.schema||'', time=eventTime(e), techs=eventTech(e), details=eventSummary(e);return `<article class="event-row"><time>${esc(time.replace('T',' ').slice(0,19))||'Ã¢â‚¬â€'}</time><span class="schema-chip">${esc(schema.replace('/v1',''))}</span><div class="event-detail">${details}</div><div class="event-tech">${techs.map(id=>`<button class="tech-chip" data-tech="${esc(id)}">${esc(id)}</button>`).join('')}</div></article>`;}
+function eventSummary(e){const s=e.schema||'';if(s==='runtime/container-exec/v1'){const i=e.identity||{},t=e.target||{},cmd=e.commandLine||'';return `<strong>${esc(i.effectiveIdentity||'?')}</strong><span>${esc(e.subresource||'exec')} Ã¢â€ â€™ ${esc(t.namespace||'')}/${esc(t.pod||'')}</span>${cmd?`<code>${redactMark(cmd)}</code>`:''}${e.redactedQueryKeys?.length?'<span class="redaction-note">Ã¢â€”Å’ Credential-shaped value withheld</span>':''}`;}if(s==='runtime/token-request/v1')return `<strong>${esc(e.namespace)}/${esc(e.serviceAccount)}</strong><span>requester ${esc(e.requesterClass)} Ã‚Â· response ${esc(e.responseCode)}</span>`;if(s==='runtime/pod-log-read/v1')return `<strong>${esc(e.namespace)}/${esc(e.pod)}</strong><span>log read Ã‚Â· ${esc(e.resolution||'')}</span>`;if(s==='network/denial-counter/v1'){const c=e.counter||{},sub=e.subject||{};return `<strong>${esc(sub.namespace)}/${esc(sub.pod)}</strong><span>+${esc(c.deltaDenied)} refused packets / +${esc(c.deltaTotal)} total Ã‚Â· ${esc(e.baselineState)}</span><small>Packet retries can count twice per refused connection.</small>`;}if(s==='network/observed-flow/v1'){const src=e.source||{};return `<strong>${esc(src.name||'?')} Ã¢â€ â€™ ${esc(e.dest)}:${esc(e.destPort)}</strong><span>${esc(e.scope)} Ã‚Â· ${esc(e.state)} ${src.role==='instrumentation'?'Ã‚Â· SENSOR PROBE':''}</span>`;}if(s==='runtime/workload-identity/v1')return `<strong>${esc(e.namespace)}/${esc(e.pod)}</strong><span>identity Ã‚Â· ${esc(e.serviceAccount)} Ã‚Â· ${esc(e.phase)}</span>`;return `<strong>${esc(s||'event')}</strong><span>${esc(JSON.stringify(e).slice(0,220))}</span>`;}
+function renderChain(c){const hops=c.hops||[],undet=new Set(c.undetectable||[]); $('#chain-meta').textContent=c.chainRun?`RUN ${c.chainRun}`:'REPORT AVAILABLE'; $('#chain-alert').innerHTML=undet.size?`<div class="undetectable-alert"><span class="alert-symbol">!</span><div><strong>${undet.size} technique${undet.size===1?'':'s'} in this chain has no detection rule.</strong><p>The chain is not fully detected. A rule with a matching technique tag still does not prove it detected that hop.</p><div>${[...undet].map(techLink).join('')}</div></div></div>`:''; $('#chain').innerHTML=hops.length?hops.map((h,i)=>{const id=h.attackId||h.attack_id||h.technique,ok=h.ok??h.passed;return `<article class="hop-row"><div class="hop-marker"><span>${String(i+1).padStart(2,'0')}</span><i></i></div><div class="hop-main"><div class="hop-top"><span>${esc(h.id||`hop-${i+1}`)}</span><span class="hop-result ${ok?'passed':'failed'}">${ok?'PASSED':'FAILED'}</span></div>${techLink(id)}<h3>${esc(h.what||h.action||'')}</h3><p>${esc(h.detail||'')}</p><div class="hop-method"><span class="method-dot ${undet.has(id)?'gap':''}"></span>${undet.has(id)?'NO RULE EXISTS':'RULE EXISTS Ã‚Â· causal attribution not established'}</div></div></article>`}).join(''):'<p class="empty-state">No chain recorded. Run the chain from Control.</p>'; }
+function namespaceName(n){return ({zerotrust:'BUSINESS ZONE','zerotrust-build':'BUILD ZONE','zerotrust-observe':'OBSERVABILITY'})[n]||n||'UNASSIGNED';}
+function renderGraph(g){const v=g.verification||{},open=g.edges||[],nodes=g.nodes||[],zones=['zerotrust-build','zerotrust','zerotrust-observe']; const byZone=new Map(zones.map(z=>[z,[]])); nodes.forEach(n=>{const z=n.namespace||'unassigned';if(!byZone.has(z))byZone.set(z,[]);byZone.get(z).push(n);}); const positive=Boolean(v.positiveControl)&&v.positiveControl!=='failed'&&v.positiveControl!=='false',consistent=Boolean(v.edgeListConsistent); $('#graph-provenance').innerHTML=`<div class="prov-check"><span class="prov-icon">${v.agreed===v.comparisons&&v.comparisons>0?'Ã¢Å“â€œ':'!'}</span><div><strong>${fmt(v.agreed||0)} / ${fmt(v.comparisons||0)}</strong><small>pairs agreed Ã‚Â· consistency check, not a security verdict</small></div></div><div class="prov-check"><span class="prov-icon">${positive?'Ã¢Å“â€œ':'!'}</span><div><strong>${positive?'Positive control passed':'Positive control unavailable'}</strong><small>${esc(v.positiveControl||'Probe result not reported')}</small></div></div><div class="prov-check"><span class="prov-icon">${consistent?'Ã¢Å“â€œ':'!'}</span><div><strong>${consistent?'Edge list consistent':'Edge list consistency unavailable'}</strong><small>${esc(v.method||'Verification method not reported')}</small></div></div>`; const cross=open.filter(e=>zoneOf(nodes,e.from)!==zoneOf(nodes,e.to)); $('#graph').innerHTML=`<div class="zone-columns">${[...byZone].map(([zone,items])=>`<div class="zone-column"><div class="zone-heading"><span>${namespaceName(zone)}</span><small>${items.length} WORKLOAD${items.length===1?'':'S'}</small></div>${items.map(n=>`<div class="node-card" data-node="${esc(n.id||n.pod||n.app||'')}"><span class="node-pip"></span><div><strong>${esc(n.app||n.pod||n.id)}</strong><small>${esc(n.namespace)}/${esc(n.pod||n.id)}</small><small>SA Ã‚Â· ${esc(n.serviceAccount||'Ã¢â‚¬â€')}</small></div></div>`).join('')||'<div class="zone-empty">No workload nodes</div>'}</div>`).join('')}</div><div class="edge-summary"><span>${cross.length} CROSS-ZONE OPEN</span><i></i><span>${open.filter(e=>e.noListener).length} PERMITTED, NO LISTENER</span></div><div class="edge-list">${open.map(e=>`<article class="edge-row ${e.noListener?'refused':''}"><span class="edge-from">${esc(e.from)}<small>${namespaceName(zoneOf(nodes,e.from))}</small></span><span class="edge-line"><i></i><span>${esc(e.protocol||'TCP')} / ${esc(e.port)}</span><i></i></span><span class="edge-to">${esc(e.to)}<small>${namespaceName(zoneOf(nodes,e.to))}</small></span><span class="edge-status ${e.noListener?'refused':''}">${e.noListener?'NO LISTENER':'OPEN'}${e.elapsedMs!=null?` Ã‚Â· ${e.elapsedMs}ms`:''}</span></article>`).join('')||'<p class="empty-state">No open edges.</p>'}</div>`; const blocked=g.blockedPairs||[]; $('#blocked-count').textContent=`${blocked.length} MODELLED DROPS`; $('#blocked-pairs').innerHTML=blocked.map(p=>`<article class="blocked-row"><span>${esc(p.from)} <i>Ã¢â€ â€™</i> ${esc(p.to)}:${esc(p.port)}</span><p>${esc(p.why||p.evidence||'Blocked by model')}</p><small>${esc(p.evidence||'')}</small></article>`).join(''); }
+function zoneOf(nodes,id){return nodes.find(n=>(n.id||n.pod)===id)?.namespace||'unknown';}
+function renderRules(){const host=$('#rules'), filter=S.technique; const rules=S.rules.filter(r=>!filter||(r.techniques||[]).includes(filter)); host.innerHTML=rules.length?rules.map(r=>{const fallback=r.schema==='network/observed-flow/v1'?'Observed flows crossing trust zones are mapped to remote service use. In this lab, sensor health probes account for the current cross-zone hits.':r.schema==='runtime/token-request/v1'?'Unexpected service account token requests may indicate an attempt to obtain or reuse workload credentials.':`This rule evaluates ${r.schema||'the configured telemetry schema'} for activity associated with ${(r.techniques||[]).join(', ')||'its mapped behavior'}. Review the matched event and its surrounding identity and workload context.`;const fp=r.falsepositives||r.falsePositives||(r.schema==='network/observed-flow/v1'?'Telemetry sensor health probes are expected in this lab. The source.role instrumentation annotation can suppress them here, but a compromised sensor could produce identical traffic.':r.schema==='runtime/token-request/v1'?'Kubelet and control-plane token requests are expected; review requesterClass and impersonation context.':'Review expected automation and control-plane activity before escalating.');return `<article class="rule-card"><div class="rule-top"><span class="rule-severity ${esc(r.level||'unknown')}">${esc(r.level||'unknown')}</span><span class="rule-id">${esc(r.id||'')}</span><span class="rule-hits">${fmt(r.hits)} <small>HITS</small></span></div><h2>${esc(r.title||r._broken||'Unavailable rule')}</h2><div class="rule-techs">${(r.techniques||[]).map(id=>`<button class="tech-chip" data-tech="${esc(id)}">${esc(id)} <span>${esc(techName(id))}</span></button>`).join('')}</div><div class="rule-meta"><span>${esc(r.schema||'schema unavailable')}</span><span>${esc(r.level||'')} severity</span></div><p class="rule-description">${esc(r.description||fallback)}</p><p class="rule-fp"><strong>TRIAGE / FALSE POSITIVES</strong> ${esc(fp)}</p><button class="sample-action" data-rule="${esc(r.id)}">INSPECT MATCHED EVENTS <span>Ã¢â€ â€”</span></button></article>`}).join(''):'<p class="empty-state">No rules match this technique.</p>'; host.querySelectorAll('[data-rule]').forEach(b=>b.addEventListener('click',()=>showSamples(b.dataset.rule))); }
+async function showSamples(id){const r=S.rules.find(x=>x.id===id); if(!r)return; const t=(r.techniques||[])[0]||''; $('#sample-title').textContent=r.title||'Match sample'; $('#samples').innerHTML=`<p class="sample-context">${esc(r.description||'Matched evidence is available in the event stream.')}</p>${(r.sample||[]).length?r.sample.map(s=>`<article class="sample-event"><time>${esc(s.collectedAt||'')}</time><p>${esc(s.summary||'')}</p><div>${(s.techniqueIds||[]).map(x=>`<button class="tech-chip" data-tech="${esc(x)}">${esc(x)} Ã‚Â· ${esc(techName(x))}</button>`).join('')}</div></article>`).join(''):'<p class="empty-state">This rule has no matched events in the current response.</p>'}<button class="sample-action" data-open-tech="${esc(t)}">OPEN RELATED EVENTS Ã¢â€ â€”</button>`; $('#samples [data-open-tech]').addEventListener('click',()=>{go('stream');$('#stream-technique').value=t;renderStream();}); }
+function selectedDate(id){const v=$(`#${id}`).value; return v?new Date(v).getTime():null;}
+async function loadStream(){if(S.streamLoading)return; S.streamLoading=true; const schema=$('#schema-filter').value,limit=$('#limit-filter').value; const url=`/api/telemetry?limit=${encodeURIComponent(limit)}${schema?`&schema=${encodeURIComponent(schema)}`:''}`; if(S.streamCacheKey!==url){$('#stream').innerHTML='<div class="skeleton"></div>'; S.streamCacheKey=url;} const {body}=await api(url); S.streamLoading=false; if(!body?.events){$('#stream').innerHTML='<p class="empty-state">No events returned. Check the telemetry collector.</p>';return;} S.events=body.events; renderStream(); }
+function renderStream(){const q=$('#event-search').value.trim().toLowerCase(),tech=$('#stream-technique').value,from=selectedDate('time-from'),to=selectedDate('time-to'); const rows=S.events.filter(e=>{if(tech&&!eventTech(e).includes(tech))return false; const tm=new Date(eventTime(e)).getTime(); if(from&&tm<from)return false;if(to&&tm>to)return false; return !q||JSON.stringify(e).toLowerCase().includes(q);}); $('#stream-count').textContent=`${fmt(rows.length)} MATCHING Ã‚Â· ${fmt(S.events.length)} LOADED Ã‚Â· TELEMETRY API RETURNS MOST RECENT EVENTS`; $('#stream').innerHTML=rows.length?rows.map(eventHTML).join(''):'<p class="empty-state">No events match the current filters.</p>'; }
+$('#technique-filter').addEventListener('change',e=>setTechnique(e.target.value)); $('#stream-technique').addEventListener('change',renderStream); $('#schema-filter').addEventListener('change',loadStream); $('#limit-filter').addEventListener('change',loadStream); $('#reload-stream').addEventListener('click',loadStream); ['event-search','time-from','time-to'].forEach(id=>$('#'+id).addEventListener('input',renderStream));
+async function loadActions(){const {body}=await api('/api/actions');if(!body){$('#actions').innerHTML='<p class="empty-state">Action service unavailable.</p>';return;}S.actions=body;$('#actions').innerHTML=Object.entries(body).map(([name,a])=>`<article class="action-card ${a.mutating?'mutating':''}"><div class="action-top"><span class="action-index">${a.mutating?'!':'/'}</span><span class="action-type">${a.mutating?'STATE CHANGE':'COLLECTION'}</span></div><h2>${esc(name)}</h2><p>${esc(a.about)}</p>${name==='collect-network'?'<span class="action-hint">Run twice to produce denial deltas.</span>':''}<button class="action-run" data-action="${esc(name)}" data-mutating="${a.mutating?'true':'false'}">${a.mutating?'RUN WITH CONFIRMATION':'RUN ACTION'} <span>Ã¢â€ â€”</span></button></article>`).join('');$('#actions').querySelectorAll('[data-action]').forEach(b=>b.addEventListener('click',()=>runAction(b)));}
+async function runAction(btn){const name=btn.dataset.action,mutating=btn.dataset.mutating==='true';if(mutating&&!window.confirm(`${name} changes cluster state. The chain creates a pod, mints a cluster-admin token and reads the database. Continue?`))return;btn.disabled=true;const {status,body}=await api(`/api/action/${encodeURIComponent(name)}${mutating?'?confirm=yes':''}`,{method:'POST'});btn.disabled=false;if(status===202&&body?.job){S.jobs.set(body.job.id,body.job);renderJobs();setRunning(true);toast(`${name} started`);tickJobs();}else toast(body?.error||`Action refused (${status})`,true);}
+function setRunning(on){S.running=on;$('#live-banner').classList.toggle('hidden',!on);$('#feed-state')?.classList.toggle('busy',on);}
+function parseOutput(line){let m=line.match(/^\[(PASS|FAIL|DONE|WARN|ERROR)\]\s*(.*)$/i);if(m)return {kind:m[1].toLowerCase(),text:m[2]}; m=line.match(/^(hop-\d+)\s+\[([^\]]+)\]\s*(.*)$/i);if(m)return {kind:'hop',text:`${m[1]} Ã‚Â· ${m[3]}`,tech:m[2]}; return {kind:'neutral',text:line};}
+function renderJobs(){const jobs=[...S.jobs.values()].sort((a,b)=>b.elapsedSeconds-a.elapsedSeconds),running=jobs.filter(j=>j.state==='running');$('#job-count').textContent=`${running.length} RUNNING`;$('#jobs-state').textContent=running.length?`${running.length} RUNNING`:jobs.length?`${jobs.length} RECENT JOBS`:'NO ACTIVE JOBS';$('#jobs').innerHTML=jobs.length?jobs.map(j=>`<article class="job-card"><div class="job-head"><strong>${esc(j.name)}</strong><span class="job-state ${esc(j.state)}">${esc(j.state)}</span><span class="job-elapsed">${j.exitCode==null?'':`EXIT ${j.exitCode} Ã‚Â· `}${esc(j.elapsedSeconds)}s</span></div><div class="job-output">${(j.output||[]).map(line=>{const p=parseOutput(line);return `<div class="output-line ${p.kind}"><span>${p.kind==='pass'?'Ã¢Å“â€œ':p.kind==='fail'||p.kind==='error'?'Ãƒâ€”':p.kind==='hop'?'Ã¢â€ Â³':'Ã‚Â·'}</span>${p.tech?techLink(p.tech):''}<code>${esc(p.text)}</code></div>`}).join('')||'<div class="output-wait">Waiting for outputÃ¢â‚¬Â¦</div>'}</div></article>`).join(''):'<p class="empty-state">Jobs started in this session will appear here.</p>';}
+async function tickJobs(){if(S.tick)return;S.tick=1;let active=false;for(const [id,j] of S.jobs){if(j.state!=='running')continue;const {body,status}=await api(`/api/job/${encodeURIComponent(id)}`);if(body?.job)S.jobs.set(id,body.job);else if(status===404)S.jobs.set(id,{...j,state:'gone'});if(S.jobs.get(id)?.state==='running')active=true;}renderJobs();S.tick=0;if(active){if(!S.running)setRunning(true);clearTimeout(S.refresh);S.refresh=setTimeout(async()=>{await refreshAll(true);},2000);}else if(S.running){setRunning(false);window.SentinelGraph&&window.SentinelGraph.setLive(false);clearTimeout(S.refresh);await refreshAll();toast('Jobs complete Ã‚Â· reports refreshed');} }
+$('#show-blocked').addEventListener('change',e=>$('#blocked-panel').classList.toggle('hidden',!e.target.checked));
+function boot(){const hash=location.hash.slice(1);if(hash&&$$('.view').some(v=>v.dataset.view===hash))go(hash);refreshAll();setInterval(()=>{if(!S.running)refreshAll();},15000);loadActions();}
+boot();

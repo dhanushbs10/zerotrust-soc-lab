@@ -35,8 +35,21 @@ param(
     [string] $Only = '',
 
     # Keep going after a failure so one broken path does not hide the state of
-    # the other four. The exit code still reflects any failure.
-    [switch] $ContinueOnFailure
+    # the others.
+    #
+    # This is now the DEFAULT, which is a change. It used to be opt-in, and
+    # measured cost: WP-02 failed three assertions transiently at 20:17 on
+    # 2026-09-26, the sweep stopped there, SP-01 never ran, and the summary
+    # claimed "6 paths, 39/42 assertions, 3 failed". Re-running WP-02 alone
+    # passed 5/5 and a full sweep passed 54/54, so nothing had actually drifted
+    # -- but the report said the lab had regressed and said it with a confident,
+    # plausible number. A single flaky path was enough to make the whole sweep
+    # lie, which is the failure mode this project keeps having to relearn in a
+    # new place.
+    #
+    # Stopping early is still available for when you want to stop at the first
+    # broken path, e.g. while bisecting a change.
+    [switch] $StopOnFirstFailure
 )
 
 Set-StrictMode -Version 2
@@ -153,7 +166,7 @@ foreach ($p in $paths) {
         attackIds = $attackIds
     }
 
-    if ($code -ne 0 -and -not $ContinueOnFailure) { break }
+    if ($code -ne 0 -and $StopOnFirstFailure) { break }
 }
 
 # ---------------------------------------------------------------------------
@@ -162,9 +175,25 @@ $totalFailed = ($results | Measure-Object -Property failed -Sum).Sum
 $notWalkable = @($results | Where-Object { $_.exitCode -ne 0 })
 $allAttackIds = @($results | ForEach-Object { $_.attackIds } | Select-Object -Unique | Sort-Object)
 
+# A sweep that stopped early, or whose catalogue cross-check disagreed, produced
+# a summary that reads exactly like a lab with fewer paths in it. Recording what
+# was *supposed* to run alongside what did is what lets a consumer tell "6 of 7
+# paths walked and 3 assertions failed" from "6 of 7 paths walked, the 7th never
+# ran, and nothing failed". Both used to be the same file with the same numbers.
+$pathsExpected = @($paths).Count
+$pathsWalkedCount = $results.Count
+$complete = ($pathsWalkedCount -eq $pathsExpected) -and `
+            ($missingFromRunner.Count -eq 0) -and `
+            ($missingFromCatalog.Count -eq 0) -and `
+            (@($results | Where-Object { $_.exitCode -eq 127 }).Count -eq 0)
+
 Write-Host ''
 Write-Host ('=' * 78)
 Write-Host ("  {0} path(s), {1} assertion(s) held, {2} failed" -f $results.Count, $totalPassed, $totalFailed) -ForegroundColor $(if ($totalFailed -eq 0 -and $notWalkable.Count -eq 0) { 'Green' } else { 'Red' })
+if (-not $complete) {
+    Write-Host ("  PARTIAL SWEEP: {0} of {1} catalogued path(s) were walked." -f $pathsWalkedCount, $pathsExpected) -ForegroundColor Yellow
+    Write-Host '  Treat the totals above as covering fewer paths than the catalogue, not as a smaller lab.' -ForegroundColor Yellow
+}
 Write-Host ("  ATT&CK techniques walked: {0}" -f ($allAttackIds -join ', '))
 if ($missingFromRunner.Count -eq 0 -and $missingFromCatalog.Count -eq 0 -and $catalogIds.Count -gt 0) {
     Write-Host ("  catalogue and runner agree on {0} path(s): {1}" -f $catalogIds.Count, ($catalogIds -join ', '))
@@ -179,6 +208,8 @@ $summary = [pscustomobject]@{
     generatedAt  = (Get-Date).ToUniversalTime().ToString('o')
     note         = 'Produced by attack/run-all.ps1. Verdicts and ATT&CK ids only; no credential, token or password is recorded here.'
     pathsWalked  = $results.Count
+    pathsExpected = $pathsExpected
+    complete     = $complete
     assertions   = [pscustomobject]@{ held = $totalPassed; failed = $totalFailed }
     attackIds    = $allAttackIds
     catalogAgrees = [pscustomobject]@{

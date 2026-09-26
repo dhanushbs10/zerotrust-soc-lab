@@ -1,192 +1,64 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ZeroTrust SOC Lab</title>
-<link rel="stylesheet" href="/static/styles.css">
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#111714">
+  <title>Fieldnotes / SOC Lab</title>
+  <link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="topology.css">
+  <script src="app.js" defer></script>
+  <script src="topology.js" defer></script>
 </head>
 <body>
-
-<header class="bar">
-  <div class="brand">
-    <span class="mark" aria-hidden="true"></span>
-    <h1>ZeroTrust SOC Lab</h1>
-    <span class="sub">soc-lab &middot; kind v1.34.0</span>
-  </div>
-  <div class="health" id="health">
-    <span class="pill pill-unknown" id="cluster-pill">checking cluster</span>
-    <span class="stamp" id="stamp"></span>
-  </div>
-</header>
-
-<nav class="tabs" role="tablist">
-  <button class="tab is-active" data-view="overview" role="tab">Overview</button>
-  <button class="tab" data-view="detections" role="tab">Detections</button>
-  <button class="tab" data-view="graph" role="tab">Reachability</button>
-  <button class="tab" data-view="chain" role="tab">Chain</button>
-  <button class="tab" data-view="stream" role="tab">Event stream</button>
-  <button class="tab" data-view="control" role="tab">Control</button>
-</nav>
-
-<main>
-
-<!-- ── overview ─────────────────────────────────────────────── -->
-<section class="view is-active" data-view="overview">
-  <div class="tiles" id="tiles">
-    <article class="tile" data-k="walks">
-      <p class="tile-k">Privilege paths</p>
-      <p class="tile-v" id="t-walks">&mdash;</p>
-      <p class="tile-n" id="tn-walks">no sweep recorded</p>
-    </article>
-    <article class="tile" data-k="chain">
-      <p class="tile-k">Purple-team chain</p>
-      <p class="tile-v" id="t-chain">&mdash;</p>
-      <p class="tile-n" id="tn-chain">no chain recorded</p>
-    </article>
-    <article class="tile" data-k="detect">
-      <p class="tile-k">Detection rules</p>
-      <p class="tile-v" id="t-detect">&mdash;</p>
-      <p class="tile-n" id="tn-detect">&mdash;</p>
-    </article>
-    <article class="tile" data-k="graph">
-      <p class="tile-k">Open paths</p>
-      <p class="tile-v" id="t-graph">&mdash;</p>
-      <p class="tile-n" id="tn-graph">&mdash;</p>
-    </article>
-  </div>
-
-  <div class="cols">
-    <section class="panel">
-      <h2>Uncovered</h2>
-      <p class="lede">Things the lab walked but cannot detect. A rule cannot fire on
-        a technique no collected schema carries, and rounding that up is how a
-        coverage report becomes fiction.</p>
-      <div id="gaps" class="gaps"><p class="empty">loading&hellip;</p></div>
+<aside class="rail" aria-label="Operations navigation">
+  <a class="monogram" href="#overview" aria-label="Sentinel SOC home">S<span>/</span></a>
+  <div class="rail-caption">WORKSPACE</div>
+  <nav class="rail-nav">
+    <button class="nav-item active" data-view="overview" aria-label="Command center" title="Command center"><span class="glyph">â–¦</span><span>Command</span></button>
+    <button class="nav-item" data-view="stream" aria-label="Telemetry" title="Telemetry"><span class="glyph">âŒ</span><span>Telemetry</span></button>
+    <button class="nav-item" data-view="detections" aria-label="Detections" title="Detections"><span class="glyph">â—Ž</span><span>Detections</span></button>
+    <button class="nav-item" data-view="chain" aria-label="Intrusion replay" title="Intrusion replay"><span class="glyph">âŸ¿</span><span>Replay</span></button>
+    <button class="nav-item" data-view="graph" aria-label="Network map" title="Network map"><span class="glyph">âŒ˜</span><span>Network</span></button>
+  </nav>
+  <div class="rail-caption lower-caption">LAB TOOLS</div>
+  <button class="nav-item control-nav" data-view="control" aria-label="Control room" title="Control room"><span class="glyph">âš™</span><span>Control</span></button>
+  <div class="rail-foot"><span class="live-dot"></span><span>LOCAL NODE</span></div>
+</aside>
+<div class="shell">
+  <header class="topbar">
+    <div class="wordmark"><span class="wordmark-icon">S</span><span>SENTINEL <i>/</i> OPERATIONS</span><span class="top-separator">/</span><span class="top-product">ZERO TRUST LAB</span></div>
+    <div class="top-meta"><span class="ops-mode"><i></i> LAB ENVIRONMENT</span><span class="cluster-name">soc-lab</span><span class="health-state" id="cluster-pill"><i></i><span>CONNECTING</span></span><span class="divider"></span><span id="stamp">Waiting for telemetry</span></div>
+  </header>
+  <main>
+    <section class="view active" data-view="overview">
+      <div class="page-head"><div><div class="eyebrow"><span>SECURITY OPERATIONS CENTER</span><span class="eyebrow-line"></span><span>CLUSTER / SOC-LAB</span></div><h1>Command center<span class="title-period">_</span></h1><p class="page-deck">Detection, exposure, and adversary activity across the local Kubernetes lab.</p></div><div class="head-date"><span>CLUSTER PROFILE</span><strong>KIND <b>Â·</b> V1.34.0</strong><small>3 NODES <span>â€¢</span> 3 TRUST ZONES</small></div></div>
+      <div class="section-kicker"><span>01</span> OPERATIONAL POSTURE <i></i><small>METHOD-BOUND MEASUREMENTS</small></div><div class="metrics-grid">
+        <article class="metric"><div class="metric-top"><span>PRIVILEGE PATHS</span><span class="metric-mark">01</span></div><div class="metric-value" id="m-walks">â€”</div><div class="metric-foot"><span id="mn-walks">No sweep recorded</span><span class="metric-unit">ASSERTIONS</span></div></article>
+        <article class="metric"><div class="metric-top"><span>CHAIN EXECUTION</span><span class="metric-mark">02</span></div><div class="metric-value" id="m-chain">â€”</div><div class="metric-foot"><span id="mn-chain">No chain recorded</span><span class="metric-unit">HOPS</span></div></article>
+        <article class="metric"><div class="metric-top"><span>DETECTION RULES</span><span class="metric-mark">03</span></div><div class="metric-value" id="m-detections">â€”</div><div class="metric-foot"><span id="mn-detections">Waiting for report</span><span class="metric-unit">ACTIVE</span></div></article>
+        <article class="metric metric-accent"><div class="metric-top"><span>REACHABLE EDGES</span><span class="metric-mark">04</span></div><div class="metric-value" id="m-graph">â€”</div><div class="metric-foot"><span id="mn-graph">No graph recorded</span><span class="metric-unit">VERIFIED</span></div></article>
+      </div>
+      <div id="live-banner" class="live-banner hidden"><span class="live-pulse"></span><div><strong>Collection in progress</strong><span>Views refresh every 2 seconds while a job is active.</span></div><span class="live-clock" id="job-count">0 RUNNING</span></div>
+      <div class="section-kicker"><span>02</span> THREAT VISIBILITY <i></i><small>ATT&amp;CK MAPPED</small></div><div class="overview-grid">
+        <section class="panel gap-panel"><div class="panel-head"><div><div class="eyebrow">VISIBILITY GAP</div><h2>What remains unseen</h2></div><span class="panel-index">A / 01</span></div><div id="gaps" class="gap-list"><div class="skeleton"></div></div><div class="panel-note">An unmapped technique cannot produce a matching rule. This is a collection gap, not a detection score.</div></section>
+        <section class="panel coverage-panel"><div class="panel-head"><div><div class="eyebrow">ATT&amp;CK TELEMETRY</div><h2>Coverage by schema</h2></div><span class="panel-index">B / 02</span></div><div class="coverage-legend"><span>TAGGED / OBSERVED</span><span>METHOD</span></div><div id="coverage" class="coverage-list"><div class="skeleton"></div></div><div class="panel-note">A ratio within each schema; inventory records are not detection coverage.</div></section>
+      </div>
+      <div class="section-kicker"><span>03</span> SENSOR HEALTH &amp; ACTIVITY <i></i><small>LOCAL TELEMETRY</small></div><div class="lower-grid"><section class="panel artifacts-panel"><div class="panel-head"><div><div class="eyebrow">COLLECTOR STATUS</div><h2>Artifact freshness</h2></div><div class="provenance-caption">Counts inherit the age of their source.</div></div><div id="artifacts" class="artifact-grid"><div class="skeleton"></div></div></section>
+      <section class="panel recent-panel"><div class="panel-head"><div><div class="eyebrow">INGESTION / LATEST</div><h2>Recent signals</h2></div><button class="text-action" data-go="stream">ALL TELEMETRY <span>â†—</span></button></div><div id="recent-events" class="event-list"><div class="skeleton"></div></div></section></div>
     </section>
 
-    <section class="panel">
-      <h2>ATT&amp;CK coverage</h2>
-      <p class="lede">Techniques the registry permits, and how many events carry each.</p>
-      <div id="coverage" class="coverage"><p class="empty">loading&hellip;</p></div>
-    </section>
-  </div>
+    <section class="view" data-view="chain"><div class="page-head"><div><div class="eyebrow"><span>ADVERSARY SIMULATION</span><span class="eyebrow-line"></span><span>ATT&amp;CK REPLAY / 06 HOPS</span></div><h1>Intrusion replay<span class="title-period">_</span></h1><p class="page-deck">Trace the simulated path through the cluster. Rule matches do not prove a hop caused them.</p></div><button class="outline-button" data-go="control">RUN SIMULATION <span>â†—</span></button></div><div id="chain-alert"></div><section class="panel chain-panel"><div class="panel-head"><div><div class="eyebrow">PURPLE TEAM / EXECUTION TRACE</div><h2>Observed sequence</h2></div><span id="chain-meta" class="panel-index">AWAITING REPORT</span></div><div id="chain" class="chain-list"><div class="skeleton"></div></div></section></section>
 
-  <section class="panel">
-    <h2>Recent artifacts</h2>
-    <p class="lede">Staleness matters more than absence here. A rotated or truncated
-      log looks exactly like a quiet cluster.</p>
-    <table class="tbl" id="artifacts">
-      <thead><tr><th>file</th><th class="num">size</th><th class="num">age</th></tr></thead>
-      <tbody><tr><td colspan="3" class="empty">loading&hellip;</td></tr></tbody>
-    </table>
-  </section>
-</section>
+    <section class="view" data-view="graph"><div class="page-head"><div><div class="eyebrow"><span>NETWORK DEFENSE</span><span class="eyebrow-line"></span><span>POLICY / DATAPATH</span></div><h1>Trust topology<span class="title-period">_</span></h1><p class="page-deck">Modelled pod paths cross-checked against the running datapath.</p></div><label class="toggle-control"><input type="checkbox" id="show-blocked"><span class="toggle-track"></span><span>Expose blocked edges</span></label></div><section class="panel provenance-strip" id="graph-provenance"><div class="skeleton"></div></section><section class="panel graph-panel"><div class="panel-head"><div><div class="eyebrow">NAMESPACE / COMMUNICATION MAP</div><h2>Verified paths</h2></div><div class="graph-legend"><span><i class="legend-open"></i>Open</span><span><i class="legend-refused"></i>No listener</span><span><i class="legend-blocked"></i>Blocked</span></div></div><div id="graph" class="zone-map"><div class="skeleton"></div></div></section><section class="panel blocked-panel hidden" id="blocked-panel"><div class="panel-head"><div><div class="eyebrow">DENY MATRIX</div><h2>Blocked pairs</h2></div><span id="blocked-count" class="panel-index"></span></div><div id="blocked-pairs" class="blocked-list"></div></section><div class="caveat"><span class="caveat-mark">i</span><p><strong>Model boundary</strong> This view covers modelled pod-to-pod paths. It cannot see remote service use by an actor already inside an allowed path, or API-server port-forward traffic that bypasses pod NetworkPolicy.</p></div></section>
 
-<!-- ── detections ───────────────────────────────────────────── -->
-<section class="view" data-view="detections">
-  <div class="cols">
-    <section class="panel wide">
-      <h2>Rules</h2>
-      <p class="lede">Every rule is parsed by pySigma, so this is a claim about the
-        reference implementation rather than about this lab's own parser. Rules key
-        on what was <em>run</em>, not who ran it: all 1050 exec sessions in this
-        cluster were opened by <code>kubernetes-admin</code>.</p>
-      <table class="tbl" id="rules">
-        <thead><tr>
-          <th>rule</th><th>technique</th><th class="num">hits</th><th>schema</th>
-        </tr></thead>
-        <tbody><tr><td colspan="4" class="empty">loading&hellip;</td></tr></tbody>
-      </table>
-    </section>
-    <section class="panel">
-      <h2>Matched events</h2>
-      <p class="lede">The first few events each rule fired on.</p>
-      <div id="samples" class="samples"><p class="empty">select a rule</p></div>
-    </section>
-  </div>
-</section>
+    <section class="view" data-view="detections"><div class="page-head"><div><div class="eyebrow"><span>DETECTION ENGINE</span><span class="eyebrow-line"></span><span id="detection-total">MATCHED EVENTS</span></div><h1>Rule intelligence<span class="title-period">_</span></h1><p class="page-deck">Sigma signal, technique context, and supporting event evidence.</p></div><div class="technique-filter"><label for="technique-filter">FILTER BY ATT&amp;CK</label><select id="technique-filter"><option value="">All techniques</option></select></div></div><div class="detection-layout"><section id="rules" class="rule-list"><div class="skeleton"></div></section><aside class="panel sample-panel"><div class="panel-head"><div><div class="eyebrow">EVENT EVIDENCE</div><h2 id="sample-title">Select a rule</h2></div></div><div id="samples" class="samples"><p class="empty-state">Choose a rule to inspect matching events.</p></div></aside></div><div class="caveat"><span class="caveat-mark">i</span><p><strong>Attribution note</strong> A matching rule establishes a signal in the event set; it does not establish that a particular chain hop caused that match.</p></div></section>
 
-<!-- ── graph ────────────────────────────────────────────────── -->
-<section class="view" data-view="graph">
-  <section class="panel">
-    <h2>Who can reach what</h2>
-    <p class="lede">Derived from live NetworkPolicies, then every modelled pair
-      verified against the datapath with probe pods dialling Service ClusterIPs.
-      Solid edges are confirmed open; the count of modelled-but-blocked pairs is
-      what a network graph calls closed.</p>
-    <div class="legend">
-      <span><i class="sw sw-open"></i>confirmed open</span>
-      <span><i class="sw sw-closed"></i>modelled, blocked</span>
-      <span><i class="sw sw-nolistener"></i>no listener</span>
-    </div>
-    <div id="graph" class="graph"><p class="empty">loading&hellip;</p></div>
-  </section>
-</section>
+    <section class="view" data-view="stream"><div class="page-head"><div><div class="eyebrow"><span>TELEMETRY INGESTION</span><span class="eyebrow-line"></span><span>REDACTED / SEARCHABLE</span></div><h1>Signal explorer<span class="title-period">_</span></h1><p class="page-deck">Search the collected evidence. Credential values are withheld; field names remain intact.</p></div><div class="feed-state"><span class="live-dot"></span> LIVE COLLECTION WATCH</div></div><section class="panel stream-panel"><div class="filters"><label>SCHEMA<select id="schema-filter"><option value="">All schemas</option><option>runtime/container-exec/v1</option><option>runtime/token-request/v1</option><option>runtime/pod-log-read/v1</option><option>network/observed-flow/v1</option><option>network/denial-counter/v1</option><option>runtime/workload-identity/v1</option></select></label><label>TECHNIQUE<select id="stream-technique"><option value="">All techniques</option></select></label><label>SEARCH EVIDENCE<input id="event-search" type="search" placeholder="Command, identity, workloadâ€¦"></label><label>FROM<input id="time-from" type="datetime-local"></label><label>TO<input id="time-to" type="datetime-local"></label><label>LIMIT<select id="limit-filter"><option>50</option><option selected>100</option><option>250</option><option>500</option></select></label><button class="outline-button filter-button" id="reload-stream">REFRESH â†»</button></div><div id="stream-count" class="stream-count">LOADING EVENTS</div><div id="stream" class="event-list stream-list"><div class="skeleton"></div></div></section><div class="caveat"><span class="caveat-mark">!</span><p><strong>Sensor annotation</strong> Four observed cross-zone flows are telemetry-agent health probes tagged <code>source.role = instrumentation</code>. That lab label is not a traffic property; a compromised sensor could produce byte-identical flows.</p></div></section>
 
-<!-- ── chain ────────────────────────────────────────────────── -->
-<section class="view" data-view="chain">
-  <section class="panel">
-    <h2>Purple-team chain</h2>
-    <p class="lede">Six hops assembled from separately catalogued findings.
-      <strong>Rule fires</strong> means a rule for that technique exists and is
-      matching &mdash; not that this hop caused the match. Attributing by technique
-      alone is the agreement-is-not-evidence mistake.</p>
-    <div id="chain" class="chain"><p class="empty">loading&hellip;</p></div>
-  </section>
-</section>
-
-<!-- ── stream ───────────────────────────────────────────────── -->
-<section class="view" data-view="stream">
-  <section class="panel">
-    <h2>Event stream</h2>
-    <p class="lede">Collected events, credential-shaped values redacted. Bounded on
-      purpose: this is for looking at an individual event, not for pulling the
-      whole corpus into a tab.</p>
-    <div class="filters">
-      <label>schema
-        <select id="schema-filter">
-          <option value="">(all)</option>
-          <option value="runtime/container-exec/v1">runtime/container-exec/v1</option>
-          <option value="runtime/token-request/v1">runtime/token-request/v1</option>
-          <option value="runtime/pod-log-read/v1">runtime/pod-log-read/v1</option>
-          <option value="runtime/workload-identity/v1">runtime/workload-identity/v1</option>
-          <option value="network/observed-flow/v1">network/observed-flow/v1</option>
-          <option value="network/denial-counter/v1">network/denial-counter/v1</option>
-        </select>
-      </label>
-      <label>limit
-        <select id="limit-filter">
-          <option>50</option><option selected>100</option><option>250</option><option>500</option>
-        </select>
-      </label>
-      <button class="btn" id="reload-stream">reload</button>
-    </div>
-    <div id="stream" class="stream"><p class="empty">loading&hellip;</p></div>
-  </section>
-</section>
-
-<!-- ── control ──────────────────────────────────────────────── -->
-<section class="view" data-view="control">
-  <section class="panel">
-    <h2>Control</h2>
-    <p class="lede">These run the lab's own scripts. The list is a fixed allowlist
-      in <code>dashboard/server.py</code>; there is no endpoint that takes a command
-      from the browser. This process can mint a cluster-admin token, so it binds to
-      loopback only and has no authentication.</p>
-    <div id="actions" class="actions"><p class="empty">loading&hellip;</p></div>
-  </section>
-
-  <section class="panel">
-    <h2>Job output</h2>
-    <div id="jobs" class="jobs"><p class="empty">no jobs yet</p></div>
-  </section>
-</section>
-
-</main>
-
-<div class="toast" id="toast" role="status" aria-live="polite"></div>
-
-<script src="/static/app.js"></script>
+    <section class="view" data-view="control"><div class="page-head"><div><div class="eyebrow"><span>ALLOWLISTED OPERATIONS</span><span class="eyebrow-line"></span><span>LOCAL ONLY</span></div><h1>Control room<span class="title-period">.</span></h1><p class="page-deck">Run the lab's fixed actions and follow the output as it arrives.</p></div><div class="control-seal"><span>BOUND</span><strong>127.0.0.1</strong><small>loopback interface</small></div></div><div class="control-note"><span class="caveat-mark">!</span><p>This control service can mint a cluster-admin token. Mutating actions require explicit confirmation; commands are fixed in the server allowlist.</p></div><div class="network-hint"><span class="hint-icon">Ã—2</span><div><strong>Network collection needs two runs.</strong><span>The first pass records a baseline. Only a second pass has denial-counter deltas.</span></div></div><div id="actions" class="action-grid"><div class="skeleton"></div></div><section class="panel jobs-panel"><div class="panel-head"><div><div class="eyebrow">ASYNC EXECUTION</div><h2>Job activity</h2></div><span id="jobs-state" class="panel-index">NO ACTIVE JOBS</span></div><div id="jobs" class="jobs-list"><p class="empty-state">Jobs started in this session will appear here.</p></div></section></section>
+    <footer class="footer"><span>SENTINEL <i>/</i> SOC-LAB</span><span>LOCAL SECURITY OPERATIONS Â· TELEMETRY IS REDACTED</span><span>NODE 01</span></footer>
+  </main>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body>
 </html>

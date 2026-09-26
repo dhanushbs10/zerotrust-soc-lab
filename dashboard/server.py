@@ -315,6 +315,24 @@ def static_files(filename: str):
     return send_from_directory(STATIC, filename)
 
 
+# Static assets are also served from the root, so a plain drop of index.html,
+# app.js and styles.css into dashboard/static/ works whatever the HTML
+# references. The replacement console used `href="styles.css"` rather than
+# `/static/styles.css`, and every asset 404'd against the `/static/`-only
+# routes -- a blank page with two console errors and no obvious cause.
+#
+# send_from_directory is given the static directory and an explicit filename, so
+# a traversal attempt cannot escape it.
+@app.get("/<path:filename>")
+def root_static(filename: str):
+    if filename.startswith("api/"):
+        return jsonify({"error": "not found"}), 404
+    candidate = os.path.join(STATIC, filename)
+    if os.path.isfile(candidate):
+        return send_from_directory(STATIC, filename)
+    return index()
+
+
 @app.get("/api/actions")
 def api_actions():
     return ok({
@@ -359,6 +377,12 @@ def api_summary():
     return ok({
         "walks": {
             "paths": walks.get("pathsWalked"),
+            # What the catalogue says should have run, and whether the sweep
+            # actually covered all of it. Without these two a sweep that stopped
+            # early produced a summary indistinguishable from a lab with fewer
+            # paths in it: same shape, same confidence, six of seven.
+            "pathsExpected": walks.get("pathsExpected"),
+            "complete": walks.get("complete"),
             "held": (walks.get("assertions") or {}).get("held"),
             "failed": (walks.get("assertions") or {}).get("failed"),
             "attackIds": walks.get("attackIds"),
@@ -404,6 +428,8 @@ def api_detections():
             "id": rule.id,
             "title": rule.title,
             "level": rule.level,
+            "description": rule.description,
+            "falsepositives": rule.data.get("falsepositives", []),
             "techniques": rule.techniques,
             "schema": rule.logsource.get("schema"),
             "hits": len(hits),

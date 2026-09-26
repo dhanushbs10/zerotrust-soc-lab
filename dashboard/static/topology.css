@@ -1,0 +1,115 @@
+/* Live trust-topology overlay
+   ------------------------------------------------------------------
+   Appended to the Sentinel visual system. The existing palette is reused
+   exactly: cyan for a verified open path, amber for permitted-but-refused, and
+   a dim slate for modelled-and-denied. Nothing new is introduced, because a
+   second accent colour in a console reads as a second meaning.
+
+   The map itself is laid out as zone columns, so an edge is drawn from the
+   right edge of the source card to the left edge of the destination card. Any
+   edge that would have to double back (both cards in the same column, stacked)
+   is drawn as a shallow loop rather than a straight line through the card. */
+
+#graph.zone-map {
+  position: relative;   /* the SVG overlay is absolutely positioned against this */
+}
+
+.edge-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: visible;
+  z-index: 3;
+}
+
+.edge-overlay-group .edge-stroke {
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+/* A wide invisible path over each edge so hovering a thin curve is possible. */
+.edge-overlay-group .edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+  pointer-events: stroke;
+}
+
+.edge-overlay-group.open .edge-stroke {
+  stroke: var(--sentinel-cyan, #22d3ee);
+  stroke-opacity: .55;
+  stroke-dasharray: 7 5;
+  animation: edge-flow 1.4s linear infinite;
+}
+
+.edge-overlay-group.refused .edge-stroke {
+  stroke: var(--sentinel-amber, #f59e0b);
+  stroke-opacity: .6;
+  stroke-dasharray: 3 4;
+  animation: none;
+}
+
+.edge-overlay-group.blocked .edge-stroke {
+  stroke: #64748b;
+  stroke-opacity: .3;
+  stroke-dasharray: 2 6;
+  animation: none;
+}
+
+.edge-overlay-group .edge-label {
+  font-family: var(--mono, ui-monospace);
+  font-size: 9.5px;
+  letter-spacing: .06em;
+  fill: #7c8798;
+  text-anchor: middle;
+  paint-order: stroke;
+  stroke: #0b0d12;
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.edge-overlay-group.open .edge-label { fill: #67e8f9; }
+.edge-overlay-group.refused .edge-label { fill: #fbbf24; }
+
+@keyframes edge-flow {
+  to { stroke-dashoffset: -12; }
+}
+
+/* Live state: while a collection job runs the edges brighten and the dash
+   quickens, so "the lab is being walked right now" is visible on the map
+   itself rather than only in a banner on another view. */
+#graph.is-live .edge-overlay-group.open .edge-stroke {
+  stroke-opacity: .95;
+  stroke-width: 2;
+  animation-duration: .55s;
+}
+
+#graph.is-live .edge-overlay-group.open .edge-label {
+  fill: #a5f3fc;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .edge-overlay-group.open .edge-stroke,
+  #graph.is-live .edge-overlay-group.open .edge-stroke {
+    animation: none;
+    stroke-dasharray: none;
+  }
+}
+
+/* Below this width the zone columns stack, so the left-to-right edge model stops
+   making sense and the flat edge list below the map is the readable view. The
+   overlay is hidden rather than made wrong. */
+@media (max-width: 860px) {
+  .edge-overlay { display: none; }
+}
+
+/* Arrowheads, so edge direction is legible without a tooltip. The observe zone
+   is the rightmost column and is the source of four of the six open edges, so
+   an always-left-to-right curve would have reversed most of this map. */
+.edge-head { stroke: none; }
+.edge-head.open    { fill: #22d3ee; fill-opacity: .85; }
+.edge-head.refused { fill: #f59e0b; fill-opacity: .85; }
+.edge-head.blocked { fill: #64748b; fill-opacity: .45; }
+
+#graph.is-live .edge-head.open { fill: #a5f3fc; }
