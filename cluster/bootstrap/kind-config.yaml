@@ -11,7 +11,47 @@ nodes:
         nodeRegistration:
           kubeletExtraArgs:
             node-labels: "zerotrust.lab/zone=control,zerotrust.lab/role=control-plane"
+      # Kubernetes does not log API requests unless explicitly told to.
+      #
+      # Two things are required, and it is easy to get only half of it right:
+      #
+      #   1. The audit POLICY file must reach the API server *container*.
+      #      extraMounts below copies the policy onto the node, but that is
+      #      not enough on its own: the API server is a static pod that only
+      #      mounts specific paths of /etc/kubernetes, so a file sitting on the
+      #      node is invisible to it. extraVolumes is what actually mounts the
+      #      directory into the container.
+      #
+      #   2. --audit-policy-file must be passed. Setting only --audit-log-path
+      #      does nothing: this API server has no default policy and silently
+      #      logs nothing.
+      #
+      # Policy level is Metadata: who did what, to which object, when, and
+      # whether it was allowed. Request bodies are deliberately NOT recorded,
+      # because bodies carry credentials.
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            audit-log-path: /var/log/kubernetes/audit/audit.log
+            audit-log-maxsize: "100"
+            audit-log-maxbackup: "2"
+            audit-policy-file: /etc/kubernetes/audit/policy.yaml
+          extraVolumes:
+            - name: audit-config
+              hostPath: /etc/kubernetes/audit
+              mountPath: /etc/kubernetes/audit
+              readOnly: true
+            - name: audit-log
+              hostPath: /var/log/kubernetes/audit
+              mountPath: /var/log/kubernetes/audit
     extraPortMappings: []
+    # Puts the policy file onto the node so extraVolumes above can expose it
+    # to the API server container.
+    extraMounts:
+      - hostPath: D:/ZeroTrust-SOC-Lab/cluster/bootstrap/audit
+        containerPath: /etc/kubernetes/audit
+        readOnly: true
   - role: worker
     image: kindest/node:v1.34.0
     kubeadmConfigPatches:

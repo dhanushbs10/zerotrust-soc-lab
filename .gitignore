@@ -52,6 +52,10 @@ tmp/
 .temp/
 local/
 
+# Collected telemetry - derived data, regenerate it, never commit
+.audit/
+.telemetry/
+
 # Local overrides
 *.local.yaml
 *.local.yml
