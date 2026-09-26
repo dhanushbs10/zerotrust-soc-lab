@@ -167,13 +167,30 @@ function Get-AuditLines {
     # Prefilter on the node rather than pulling 50 MB across the boundary.
     # Quote-free: PowerShell strips embedded double quotes before a native
     # executable sees them, so the pattern is a bare word.
-    Write-Host ("  source: docker exec {0} grep subresource {1}" -f $cp, $AuditLogPath) -ForegroundColor DarkGray
-    $out = & docker exec $cp sh -c "grep subresource $AuditLogPath" 2>&1
+    #
+    # The glob covers ROTATED files as well as the live one. Measured: the
+    # apiserver rotated its audit log during Phase 8, and a grep of audit.log
+    # alone returned 158 candidate lines where the export held 108002 records.
+    # The collector therefore reported 14 exec sessions and 0 pod log reads for
+    # a lab that had run 978 exec sessions, and every detection that depends on
+    # this data quietly stopped matching. Silent telemetry loss is the failure
+    # mode this project keeps having to relearn, and rotation is one of its
+    # natural causes.
+    #
+    # `audit*.log` expands in shell order, and 'audit-<timestamp>.log' sorts
+    # before 'audit.log' because '-' is 0x2D and '.' is 0x2E, so the candidates
+    # arrive oldest first. -h suppresses the filename prefix that grep would
+    # otherwise prepend, which would corrupt each JSON line.
+    $auditGlob = ($AuditLogPath -replace '/[^/]+$', '') + '/audit*.log'
+    Write-Host ("  source: docker exec {0} grep -h subresource {1}" -f $cp, $auditGlob) -ForegroundColor DarkGray
+    $out = & docker exec $cp sh -c "grep -h subresource $auditGlob" 2>&1
     if ($LASTEXITCODE -ne 0) {
         $errTxt = ($out | Out-String).Trim()
-        throw "could not read $AuditLogPath from $cp : $errTxt"
+        throw "could not read $auditGlob from $cp : $errTxt"
     }
-    return @($out)
+    $lines = @($out)
+    Write-Host ("  audit files matched: {0}" -f (& docker exec $cp sh -c "ls -1 $auditGlob" 2>$null | Measure-Object).Count) -ForegroundColor DarkGray
+    return $lines
 }
 
 # ------------------------------------------------------------------ #

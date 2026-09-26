@@ -436,8 +436,18 @@ class Rule:
         self.condition = condition
         self._tokens = _tokenize(condition)
 
-        techniques = [t for t in self.tags if isinstance(t, str) and t.startswith("attack.")]
-        self.techniques = [t.split(".", 1)[1] for t in techniques]
+        # Sigma spells sub-techniques in lower case (`attack.t1609.001`) while
+        # ATT&CK and every other part of this lab spell them upper case
+        # (`T1609.001`). Normalising here means a rule's technique can be
+        # compared with a chain's, an event's candidateTechniques, and the
+        # registry's table without every call site remembering to.
+        #
+        # This was a real bug: the Phase 8 chain report said "NO RULE" for all
+        # six hops while the rules were loaded and firing, because the dict
+        # lookup was case-sensitive and the two sides disagreed on the case of
+        # the letter T.
+        techniques = [t for t in self.tags if isinstance(t, str) and t.lower().startswith("attack.t")]
+        self.techniques = [t.split(".", 1)[1].upper() for t in techniques]
 
         if not self.techniques:
             raise SigmaError(

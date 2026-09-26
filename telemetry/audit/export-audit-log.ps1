@@ -79,7 +79,41 @@ if ($exists.Trim() -ne 'yes') {
 }
 
 Write-Host 'Reading audit log from control plane...' -ForegroundColor Cyan
-$raw = & docker exec $ControlPlane cat $NodeAuditLog 2>$null | Out-String
+
+# The apiserver rotates its own audit log. Reading only audit.log silently
+# drops every rotated file, and silent telemetry loss is indistinguishable from
+# a quiet cluster -- which is the exact confusion this lab exists to avoid.
+#
+# Measured: the rotation happened at 19:14 during Phase 8, moving 104MB and
+# 91479 records into audit-2026-09-26T19-14-19.668.log. The exporter read 1125
+# records afterwards and reported success, because "the log had fewer records"
+# and "the log had been rotated" look the same from the outside.
+#
+# Filenames sort oldest-first on purpose: 'audit-<timestamp>.log' precedes
+# 'audit.log' because '-' is 0x2D and '.' is 0x2E. Rotated files therefore come
+# before the live one and the export stays in chronological order.
+# Split-Path is the Windows implementation and strips the separators off a POSIX
+# path, turning /var/log/kubernetes/audit into varlogkubernetesaudit. This is a
+# path inside the node, so it is split as a string.
+$auditDir = ($NodeAuditLog -replace '/[^/]+$', '')
+$files = @(& docker exec $ControlPlane sh -c "ls -1 $auditDir" 2>$null |
+    Where-Object { $_ -like 'audit*.log' } | Sort-Object)
+if ($files.Count -eq 0) {
+    throw "No audit log at $NodeAuditLog inside $ControlPlane. Was the cluster created with the audit config in kind-config.yaml?"
+}
+
+$raw = ''
+foreach ($f in $files) {
+    $part = (& docker exec $ControlPlane cat "$auditDir/$f" 2>$null | Out-String)
+    $lines = @($part -split "`n" | Where-Object { $_.Trim() }).Count
+    $tag = if ($f -eq 'audit.log') { 'live' } else { 'rotated' }
+    Write-Host ("  {0,-8} {1,-45} {2} line(s)" -f $tag, $f, $lines) -ForegroundColor DarkGray
+    $raw += $part
+}
+if ($files.Count -gt 1) {
+    Write-Host ("  {0} file(s) read; the log has rotated at least once. A single-file read would have" -f $files.Count) -ForegroundColor Yellow
+    Write-Host '  reported a plausible, much smaller number and looked like a quiet cluster.' -ForegroundColor Yellow
+}
 
 $cutoff = if ($SinceMinutes -gt 0) { (Get-Date).ToUniversalTime().AddMinutes(-$SinceMinutes) } else { [datetime]::MinValue }
 

