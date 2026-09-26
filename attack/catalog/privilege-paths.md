@@ -21,13 +21,37 @@ is irrelevant until something can reach its process.
 
 ## Inventory
 
-| ID | Kind | Summary | ATT&CK | Verified by |
-|----|------|---------|--------|-------------|
-| PP-01 | Privilege path | `sa-build-runner` is bound to `cluster-admin` | T1078.001, T1098.003 | `test-boundaries.ps1` (4 `can-i` checks) |
-| PP-02 | Privilege path | The sensor can open a TCP path to all three business workloads | T1078.001 | `test-boundaries.ps1` (3 network checks) |
-| WP-01 | Weakness | `web-frontend` runs as root with no `securityContext` | T1610, T1611 | Phase 2 drift test |
-| WP-02 | Weakness | `sa-telemetry-agent` holds a mounted token that grants nothing | T1550.001 | Phase 2 drift test |
-| SP-01 | Weakness | The database password is duplicated in a readable ConfigMap | T1552.001 | Phase 3 scanner |
+| ID | Kind | Summary | ATT&CK | Walked by | Assertions |
+|----|------|---------|--------|-----------|-----------|
+| PP-01 | Privilege path | `sa-build-runner` is bound to `cluster-admin`, and the token leaves the zone it is sealed in | T1078.001, T1190, T1550.001 | `walk-pp-01-cluster-admin.ps1` | 10 |
+| PP-02 | Compensating control | The sensor can open a TCP path to all three business workloads and holds no credential for any of them | T1046, T1550.001 | `walk-pp-02-sensor-reach.ps1` | 7 |
+| WP-01 | Weakness | `web-frontend` explicitly sets `runAsNonRoot: false` and has no container-level `securityContext` | T1610, T1611 | `walk-wp-01-frontend-root.ps1` | 9 |
+| WP-02 | Weakness | `sa-telemetry-agent` mounts a token that carries no permission on any cluster resource | T1550.001 | `walk-wp-02-sensor-token.ps1` | 5 |
+| SP-01 | Weakness | The database password is duplicated in a ConfigMap, and it is a live superuser credential | T1552.001 | `walk-sp-01-configmap-leak.ps1` | 11 |
+
+Run them all with `attack\run-all.ps1`. It exits non-zero if any path's
+assertions stop holding, and it cross-checks this table against the walk scripts
+so an entry cannot be quietly deleted from one place and left in the other.
+
+### What the walks changed about these entries
+
+Every summary above was revised after being measured, and three of the five were
+wrong in the direction of overstating the risk. That is recorded here rather than
+silently corrected, because a catalogue that only ever gets edited to look more
+alarming is not a catalogue.
+
+- **PP-01** claimed the attacker operates from inside the build pod. They cannot.
+  The build zone cannot reach the API server at all, so the walk reads the token
+  in-pod and spends it from outside. See the correction below.
+- **PP-02** was catalogued as T1078.001. It is not an account at all; it is
+  reconnaissance, T1046, plus the token half it shares with WP-02.
+- **WP-01** claimed "no `securityContext`". The pod sets one, and it sets
+  `runAsNonRoot: false`. An opt-out is a stronger finding than an omission.
+- **WP-02** claimed the token "grants nothing". It grants
+  `system:basic-user` and the public discovery URLs, which every authenticated
+  identity inherits. The posture is right; the phrasing was not.
+- **SP-01** claimed an unprivileged workload could read the leak. None can. The
+  finding is weaker than catalogued and different in kind.
 
 ---
 
@@ -35,8 +59,15 @@ is irrelevant until something can reach its process.
 
 **Resource** `ClusterRoleBinding/build-runner-cluster-admin`
 → `ClusterRole/cluster-admin`
-**Techniques** T1078.001 Valid Accounts: Default Accounts · T1098.003 Account
-Manipulation: Additional Cloud Roles
+**Techniques** T1078.001 Valid Accounts: Default Accounts · T1190 Exploit
+Public-Facing Application · T1550.001 Use Alternate Authentication Material:
+Application Access Token
+**Walked by** `attack/walk-pp-01-cluster-admin.ps1` — 10 assertions
+
+> **Corrected by measurement.** This entry previously claimed that control-plane
+> access is simply "not pod-to-pod traffic", and demonstrated it by having the
+> attacker sit inside the build runner and use its token. That demonstration does
+> not work, and finding out why changed the lesson.
 
 ### Why it exists
 
@@ -46,19 +77,42 @@ because the interesting part is what it is *not* protected by.
 The build zone is genuinely isolated. `identities/34-networkpolicy-zones.yaml`
 gives `build-runner` no ingress at all and egress to DNS only, and
 `identities/31-...default-deny.yaml` denies everything else in the namespace.
-An attacker inside the build runner cannot reach the database, the frontend, or
-the API server over the network.
+The container itself is hardened too: uid 101, read-only root filesystem,
+all capabilities dropped, default seccomp profile. It is a real CI agent, running
+`git` and `docker`, not a web server pretending to be one.
 
-That containment is irrelevant here, and this is the lesson:
+### What the walk found, and why it matters more
 
-> **RBAC and network reach are independent axes.** Control-plane access is not
-> pod-to-pod traffic. The attacker does not send a packet to `postgres`. They
-> authenticate to the API server, ask it for the credential, and then open the
-> one connection the network policy does permit.
+Measured from inside the pod:
 
-The network policy stops nothing on this path. The compensating control that
-should have existed — not granting a CI job control-plane admin — is the one
-that is missing.
+```
+kubernetes.default.svc  -> resolves to 10.96.0.1
+nc -z kubernetes.default.svc 443   -> BLOCKED
+nc -z postgres.zerotrust.svc 5432 -> BLOCKED
+```
+
+The build runner cannot reach the API server. So the attacker cannot sit in the
+build zone and exercise `cluster-admin` from there, and the walk does not pretend
+otherwise: it reads the projected token off the filesystem, carries it out, and
+spends it from the operator host.
+
+The lesson that replaces the old one is sharper:
+
+> **A NetworkPolicy constrains a workload. A copied credential is no longer a
+> workload.**
+
+The isolation was real, it was measured, and it did nothing — because the thing
+that made PP-01 dangerous was never traffic. The pod's identity was over-granted,
+and identity travels with the token no matter how well the network around the pod
+is sealed. No egress allow was added to make the demo work; a fragile
+post-DNAT exception would have taught the wrong lesson and weakened the lab to
+prove a point.
+
+Worth stating alongside it: **no pod in this cluster can reach the API server.**
+All four workload identities are blocked from 443. Every service account token
+here is latent, and the network policies are carrying the entire containment
+while RBAC does none of the work. "Default-deny plus narrow RBAC" reads like two
+independent controls; in this cluster only one of them is load-bearing.
 
 ### What an attacker does with it
 
@@ -66,15 +120,18 @@ that is missing.
 # 1. read the credential the pod should never have been able to read
 kubectl get secret postgres-credentials -n zerotrust -o jsonpath='{.data.password}' | base64 -d
 
-# 2. create a pod in the business zone; no policy stops this, because it is
+# 2. or read it from the ConfigMap instead, which needs no base64 decode
+kubectl get configmap app-config-leak -n zerotrust -o jsonpath='{.data.DB_PASSWORD}'
+
+# 3. create a pod in the business zone; no policy stops this, because it is
 #    not a pod-to-pod connection
 kubectl run exfil --image=postgres -n zerotrust --restart=Never -- \
   env PGPASSWORD=<decoded> psql -h postgres -U orders -d acme -c '\dt'
-
-# 3. or simply read every Secret in the cluster with `kubectl get secrets -A`
 ```
 
-Step 3 needs no network path at all. That is what `cluster-admin` means.
+Step 3 needs no network path from the build zone at all. The pod it creates is
+a *new* workload in a *new* place, and the policy that sealed the runner has
+nothing to say about it. That is what `cluster-admin` means.
 
 ### Detection
 
@@ -88,7 +145,12 @@ attack rather than during it.
 
 **Resource** `NetworkPolicy/{web-frontend,orders-api,postgres}-ingress`
 → rule admitting `sa-telemetry-agent` in the observe zone
-**Technique** T1078.001 Valid Accounts: Default Accounts
+**Techniques** T1046 Network Service Scanning · T1550.001 Application Access Token
+**Walked by** `attack/walk-pp-02-sensor-reach.ps1` — 7 assertions
+
+> **Corrected by measurement.** Catalogued as T1078.001, which is a valid account
+> technique. It is not an account: this is reconnaissance plus reach, and the
+> walk measures it as such.
 
 ### Why it exists
 
@@ -102,16 +164,25 @@ A second pod dropped into `zerotrust-observe` does not inherit the path.
 
 ### Why it is survivable
 
-The compensating control is that `sa-telemetry-agent` holds **no** Kubernetes
-API permissions. It can open a TCP connection to 5432 and go no further,
-because it has no database credential. That is the difference between seeing
-that a door is open and walking through it.
+Reachability is not access, and the walk asserts both halves rather than only
+the flattering one.
 
-This is also the one privilege path in the lab that is granted on purpose
-rather than planted by mistake, and it is here because a monitor with no reach
-is a monitor nobody can debug. The risk is real: an attacker who compromises the
-sensor inherits observation of the whole business zone, and the sensor is by
-construction the only pod allowed to touch all three.
+Measured: all three business workloads are `REACHABLE` from the sensor, and the
+API server is `BLOCKED`. The sensor's full environment was read — every variable
+is a service-discovery entry, `PATH`, `HOME`, `HOSTNAME` or
+`PROBE_INTERVAL_SECONDS`, and the count of `PG*` / `DATABASE*` / `DB_*` variables
+is **0**. Its service account token cannot list Secrets, cannot list pods, and
+cannot create a pod.
+
+So the sensor can see three open doors and holds no key to any of them. The
+compensating control is the *combination*: the reach is bounded to three ports on
+one named pod, and the authority is empty.
+
+This is also the one grant in the lab made on purpose rather than planted by
+mistake, and it is here because a monitor with no reach is a monitor nobody can
+debug. The risk is real: an attacker who compromises the sensor inherits
+observation of the whole business zone, and the sensor is by construction the only
+pod allowed to touch all three.
 
 The honest summary is that observation authority is a privilege, and this lab
 carries it explicitly rather than pretending detection is free.
@@ -123,9 +194,15 @@ carries it explicitly rather than pretending detection is free.
 kubectl exec -n zerotrust-observe <sensor-pod> -- nc -w 3 postgres.zerotrust.svc.cluster.local 5432
 ```
 
-Useful for reconnaissance (which is T1046 Network Service Discovery) and as a
-pivot to a service that admits nothing else. It is not sufficient to read the
-database without also obtaining the credential.
+Useful for reconnaissance (T1046) and as a pivot to a service that admits nothing
+else. It is not sufficient to read the database without also obtaining the
+credential — and the sensor cannot obtain it, because the ConfigMap carrying it
+is unreadable to this identity and the API server is blocked.
+
+The chain that *does* work is PP-01 plus PP-02: steal a cluster-admin token from
+the CI runner, read the password, then act from a pod that already sits inside the
+permitted path. That chain is assembled in Phase 8 out of two separately
+catalogued findings rather than a third planted weakness.
 
 ### Detection
 
@@ -139,33 +216,80 @@ it is expected to fire exactly once in a correctly configured lab.
 
 **Resource** `Deployment/web-frontend`
 **Techniques** T1610 Deploy Container · T1611 Escape to Host
+**Walked by** `attack/walk-wp-01-frontend-root.ps1` — 9 assertions
+
+> **Corrected by measurement.** This entry said "no `securityContext`". The pod
+> has one. It sets `runAsNonRoot: false`, which is a decision rather than an
+> oversight, and it is a worse finding than the one that was written down.
 
 ### The condition
 
-No `runAsNonRoot`, no `allowPrivilegeEscalation: false`, no dropped
-capabilities, no read-only root filesystem. The container starts as uid 0. If an
-attacker reaches the process they are root inside it before exploiting anything.
+Measured from the running pod:
+
+```
+pod-level securityContext       : {"runAsNonRoot": false}
+container-level securityContext : absent entirely
+id -u                           : 0
+```
+
+So: an explicit opt-out of non-root, and on top of that no
+`allowPrivilegeEscalation: false`, no `readOnlyRootFilesystem`, no
+`capabilities.drop`, and no `seccompProfile`. `orders-api`, immediately below it
+in `workloads/10-frontend-and-api.yaml`, sets all five on the **same image
+digest** — which is what makes this a controlled comparison rather than an
+opinion.
+
+### What uid 0 is actually worth here, measured
+
+"It runs as root" is a claim every scanner makes. The walk puts a number on it by
+asking both pods the same question with `test -w`, which queries the kernel and
+changes nothing:
+
+```
+web-frontend (uid 0,  no securityContext) : document-root-WRITABLE
+orders-api   (uid 101, readOnly rootfs)   : document-root-readonly
+```
+
+Identical image, identical filesystem layout, opposite capability. The only
+variable is the `securityContext`.
+
+That matters because `web-frontend` serves content to users. A root process in
+that container can rewrite what is served, so compromising this pod is
+compromising whatever the user is looking at at that moment. The walk also
+confirms the process can rewrite its own `/etc/passwd` and can address `/proc/1/root`
+— the preconditions for persistence inside the container and for an escape
+attempt respectively. Neither the rewrite nor the escape is performed; both are
+printed under "withheld" with the exact command.
 
 The fix is four lines. It is omitted so there is something real for a detection
-to find. `workloads/10-frontend-and-api.yaml` contains the corrected version in
-`orders-api`, immediately below, for direct comparison.
+to find.
 
 ### Detection
 
 `DET-0007` — a workload with no `securityContext.runAsNonRoot`, or with
-`privileged: true`, or with an added capability beyond a small allowlist.
+`runAsNonRoot: false`, or with `privileged: true`, or with an added capability
+beyond a small allowlist. The `runAsNonRoot: false` case is in the rule on
+purpose: an explicit `false` is a decision someone made, and a scanner that only
+looks for a missing key will not see it.
 
 ---
 
-## WP-02 — the sensor mounts a token that grants nothing
+## WP-02 — the sensor mounts a token with no authority behind it
 
 **Resource** `ServiceAccount/sa-telemetry-agent`
 **Technique** T1550.001 Use Alternate Authentication Material: Application
 Access Token
+**Walked by** `attack/walk-wp-02-sensor-token.ps1` — 5 assertions
+
+> **Corrected by measurement.** This entry said the token "grants nothing". It
+> does not. It grants `system:basic-user` and the public discovery URLs, because
+> every authenticated identity in every Kubernetes cluster inherits those. The
+> posture is correct and the phrasing was not.
 
 ### The condition
 
-`automountServiceAccountToken: true` on an identity with no API permissions.
+`automountServiceAccountToken: true` on an identity with no permission on any
+cluster resource.
 
 This started the other way around: the sensor was granted a read-only
 ClusterRole over pods, ConfigMaps, RBAC and NetworkPolicies, and then discovered
@@ -180,6 +304,46 @@ sensor's identity: without it, every connection the sensor opens appears in the
 audit log as an anonymous pod rather than as `sa-telemetry-agent`, and an
 unattributable sensor is a sensor nobody can trust afterwards.
 
+### What the walk measures, precisely
+
+Asked of the API server rather than read out of a manifest, because a manifest
+can be out of step with what is actually bound:
+
+```
+SelfSubjectRulesReview: 24 entries
+  resource-scoped, self-review only : 3   (system:basic-user)
+  non-resource, public discovery    : 20  (system:discovery, system:public-info-viewer)
+  anything else                     : 0
+```
+
+and four explicit denials — `list secrets`, `list pods`, `create pods`,
+`get configmaps` — all refused.
+
+The three self-review creates let an identity ask the API server what it may do.
+That is a read of its own permissions, not access to anything, and it is granted
+to `system:authenticated`. This is the finding stated honestly rather than
+dramatically: **the token carries no permission on any cluster resource, only
+what every identity already has.**
+
+### The real point: PP-01 and WP-02 are the same pod setting
+
+```
+pod spec          automount   identity                        grants on cluster resources
+telemetry-agent   True        sa-telemetry-agent (observe)    none beyond the baseline
+build-runner      True        sa-build-runner (build)         cluster-admin, everything
+```
+
+Identical pod spec, opposite blast radius, and the only difference is a
+`ClusterRoleBinding` that no pod manifest mentions. Neither can be judged by
+reading a workload file, which is why both are walked.
+
+A latent token is still a credential: a token worth nothing today becomes
+worth something the moment a `RoleBinding` is added, with no change to the pod,
+no restart, and nothing in the spec to review. The correct long-term answer is
+`automountServiceAccountToken: false`, which is a redesign rather than a tweak —
+a reachability sensor that cannot reach the API server cannot report what it
+finds.
+
 ### Detection
 
 `DET-0009` — a ServiceAccount with a mounted token and no RoleBinding. Cheap to
@@ -192,11 +356,20 @@ RBAC that was tightened later.
 
 **Resource** `ConfigMap/app-config-leak`
 **Technique** T1552.001 Unsecured Credentials: Credentials In Files
+**Walked by** `attack/walk-sp-01-configmap-leak.ps1` — 11 assertions
+
+> **Corrected by measurement, twice.** The original entry said an attacker with
+> a foothold could read the leak. None of the lab's workload identities can. The
+> finding is weaker than catalogued, and it is about something other than what it
+> was assumed to be about.
 
 ### The condition
 
 The same password from `Secret/postgres-credentials`, in plaintext, in a
-ConfigMap, annotated `zerotrust.lab/weakness: SP-01`.
+ConfigMap, annotated `zerotrust.lab/weakness: SP-01` — and a second time,
+embedded verbatim inside `DATABASE_URL`. Both copies fingerprint to
+`A069F0C1482A91C8` under the same algorithm `tools/scan-secrets.ps1` uses, so the
+walk and the scanner agree on which copy is which.
 
 ConfigMaps require `get configmaps`, which is far more commonly granted than
 `get secrets`. Copying a password out of a Secret into a ConfigMap "so the
@@ -206,6 +379,82 @@ leak, and it leaves no trace in any audit log.
 The correct value is in a Secret, referenced by name in
 `ConfigMap/orders-api-config` (`DB_PASSWORD_SECRET: postgres-credentials`), and
 projected into the pod at runtime. The leak exists to be found.
+
+### Who can actually read it
+
+Measured with `auth can-i`, one call per identity:
+
+| identity | verdict |
+|----------|---------|
+| `sa-web-frontend` | no |
+| `sa-orders-api` | no |
+| `sa-telemetry-agent` | no |
+| `sa-build-runner` | **yes** |
+
+`sa-orders-api` *can* read ConfigMaps in `zerotrust`, but its Role is narrowed
+with `resourceNames: [orders-api-config]`, so the leak falls outside the grant.
+That is a real control working as designed.
+
+The only identity that can read the leak is the one that already owns the entire
+cluster via PP-01. **So this is not privilege escalation**, and a walk that
+demonstrated it would have been demonstrating a vulnerability the lab does not
+have.
+
+### The part that does hold: it is a live superuser credential
+
+Reachability is not the finding. The finding is that this specific visible string
+is a current, valid, superuser password, proven rather than assumed.
+
+The obvious test is worthless, and fails in the most dangerous way available:
+
+```
+psql -h 127.0.0.1 ...                 no password   -> succeeds
+PGPASSWORD=wrong psql -h 127.0.0.1 ...              -> succeeds
+```
+
+Both succeed, because `pg_hba.conf` rule 2 trusts `127.0.0.1`. A walk written
+that way would have "proved" the leaked password works while actually proving the
+database ignores passwords entirely. The walk asserts this inadequacy explicitly
+before relying on anything downstream.
+
+The real test uses the pod's routable address, where rule 7 applies
+`scram-sha-256` — one route, one query, three passwords:
+
+```
+10.244.1.7:5432   no password     -> refused
+                   wrong password  -> FATAL: password authentication failed for user "orders"
+                   leaked password -> orders
+```
+
+Two failures and one success is what makes the success mean something. And the
+role it authenticates as is not a scoped reporting account:
+
+```
+rolname | rolsuper | rolcreatedb | rolcreaterole
+orders  | t        | t           | t
+```
+
+The name says `orders`; the privilege says superuser.
+
+### Why the real risk is rotation, not theft
+
+Three things follow, and none of them is "an unprivileged workload steals the
+database password":
+
+1. **PP-01 gets a second, quieter route to the same secret.** ConfigMap data
+   needs no base64 decode, so it is a smaller and less obviously security-relevant
+   step than `get secrets`.
+2. **Two copies means two things to rotate.** Rotating `postgres-credentials`
+   does not touch this ConfigMap. An operator who rotates the Secret and considers
+   the job done has left the previous password in the cluster in clear text.
+3. **A stale copy is undetectable by eye.** Only a fingerprint comparison tells a
+   rotated credential from a live one, which is why the walk compares
+   fingerprints and never prints the values.
+
+The rotation trap is argued here from the mechanism — a copy that nothing rotates
+is a copy that outlives the rotation meant to revoke it. Demonstrating it by
+actually rotating and re-testing is Phase 8 work, where a rotation can be done and
+undone deliberately.
 
 ### Detection
 

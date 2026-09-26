@@ -287,6 +287,23 @@ function Invoke-Kubectl {
         throw ("Invoke-Kubectl received one argument containing whitespace. That is the signature of PowerShell binding ',' tighter than '+', which collapses a multi-element argument list into one space-joined string. Parenthesise each element: @(('a=' + `$x), ('b=' + `$y)). Received: " + $Arguments[0])
     }
 
+    # The same mistake takes a second shape, and this one does not collapse the
+    # list -- it splits it. Written unparenthesised:
+    #
+    #     @('auth', 'can-i', 'get', 'x', '--as=' + $id)
+    #
+    # arrives as two separate arguments, '--as=' and the identity. kubectl reads
+    # the option as having an empty value and reports "you must specify two
+    # arguments: verb resource or verb resource/resourceName", which says nothing
+    # whatsoever about the real problem.
+    #
+    # An option with an empty value is never intentional, so it is a reliable
+    # signature for the bug no matter which way the precedence went.
+    $emptyOption = @($Arguments | Where-Object { $_ -match '^--[a-zA-Z][a-zA-Z0-9-]*=$' })
+    if ($emptyOption.Count -gt 0) {
+        throw ("Invoke-Kubectl received an option with an empty value: {0}`n  This is unparenthesised concatenation, e.g. '--as=' + `$id, which PowerShell split into two arguments. Write ('--as=' + `$id) with parentheses.`n  Full list: {1}" -f ($emptyOption -join ', '), ($Arguments -join ' | '))
+    }
+
     $out = & kubectl @Arguments 2>&1 | Out-String
     return [pscustomobject]@{
         exitCode = $LASTEXITCODE
@@ -304,6 +321,64 @@ function Invoke-Kubectl {
     the mechanism DET-0002-era runtime detections key on, so these calls are not
     incidental -- they are part of what Phase 5 and Phase 7 consume.
 #>
+<#
+    A stable, non-reversible label for a credential.
+
+    Two copies of the same password produce the same fingerprint, which is what
+    lets a report say "these are one credential" without ever printing the
+    value. This is the same algorithm tools/scan-secrets.ps1 uses, deliberately,
+    so a walk script and the scanner agree on the label for the same secret. If
+    the two ever disagree, one of them is wrong about which copy is which.
+#>
+function Get-Fingerprint {
+    param([string] $Value)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $hex = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value)))) -replace '-', ''
+    $sha.Dispose()
+    return $hex.Substring(0, 16)
+}
+
+<#
+    Runs a single command inside a lab pod and returns its combined output.
+
+    THE COMMAND MUST BE QUOTE-FREE
+    ------------------------------
+    Only characters that survive PowerShell's native argument marshalling may
+    appear here: no " ' ( ) { } $ * ? [ ] or backtick.
+
+    PowerShell hands the argument to kubectl.exe having stripped any embedded
+    double quotes, so the pod's shell receives a command whose quoting has
+    silently evaporated:
+
+        Invoke-InPod -Command 'env | grep -ciE "^(PG|DATABASE|DB_)"'
+        -> sh: syntax error: unexpected "("
+
+    That one is at least loud. The dangerous case is a command that merely
+    misbehaves once its quoting is gone -- an unquoted glob that expands, a
+    bracket that turns into a redirect -- and returns a plausible wrong answer
+    that a later assertion happily records as a finding.
+
+    Write group alternation as repeated patterns instead:
+
+        env | grep -ci -e ^PG -e ^DATABASE -e ^DB_ || true
+
+    Piping a script in on stdin is NOT an escape from this. It was tried and
+    measured: Windows PowerShell 5.1 has no input redirection at all ('<' is
+    "reserved for future use"), and Get-Content piped to a native command
+    re-emits every line with CRLF, which busybox sh rejects --
+
+        for x in a b c; do
+          echo "loop-$x"
+        done
+
+    fails with `sh: syntax error: unexpected word (expecting "do")` whether the
+    source file was written with LF or CRLF, because the corruption happens in
+    the PowerShell pipeline rather than in the file. So the rule stands: keep
+    in-pod commands simple enough to pass as one argument.
+
+    The guard below enforces it, because a loud failure here is worth far more
+    than a quiet wrong answer.
+#>
 function Invoke-InPod {
     param(
         [Parameter(Mandatory)] [string] $Namespace,
@@ -312,6 +387,9 @@ function Invoke-InPod {
         [Parameter(Mandatory)] [string] $Command,
         [int] $TimeoutSeconds = 30
     )
+    if ($Command -match '["''(){}\[\]*?$`]') {
+        throw ("In-pod command contains a character that PowerShell's native marshalling will mangle: {0}`n  Write group alternation as repeated -e patterns, and precompute anything else in PowerShell." -f $Command)
+    }
     $out = & kubectl exec -n $Namespace $Pod -- $Shell '-c' $Command 2>&1 | Out-String
     return $out.TrimEnd()
 }

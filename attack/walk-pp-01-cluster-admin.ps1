@@ -96,7 +96,8 @@ $podName = Get-Prop (Get-Prop $pod 'metadata') 'name'
 Write-Step -AttackId 'T1190' -Description 'gain code execution in the build runner' | Out-Null
 
 Write-Observed "pod: $podName"
-$who = Invoke-InPod -Namespace $ns -Pod $podName -Shell 'sh' -Command 'id; echo "--- what this workload actually is ---"; git --version 2>&1; docker --version 2>&1'
+Write-Observed 'identity and CI toolchain, in the order a build agent would report them:'
+$who = Invoke-InPod -Namespace $ns -Pod $podName -Shell 'sh' -Command 'id; git --version 2>&1; docker --version 2>&1'
 Write-Observed $who
 
 Write-Assertion -Expected 'running as a non-root uid, not 0' `
