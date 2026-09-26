@@ -1,0 +1,72 @@
+title: Connection between workloads in different trust zones
+id: 03170000-0000-4000-8000-000000000006
+status: experimental
+description: |
+  An observed flow crossed a trust-zone boundary. A connection between two
+  workloads in different zones is remote service use by definition, which is why
+  this is a direct mapping rather than an inferred one.
+
+  Read this rule's result in this lab with the caveat below
+  --------------------------------------------------------
+  This is the one rule in the set that has no attack-step positive, and the
+  reason is structural rather than an oversight. The only cross-zone paths the
+  lab grants are the three PP-02 grants from the sensor, and the collector
+  labels every one of them `source.role = instrumentation` because they are the
+  sensor's own health probes. All four cross-zone flows in the current telemetry
+  carry that label and all four are `sa-telemetry-agent`.
+
+  Adding a cross-zone grant purely to give this rule a positive would weaken the
+  lab to prove a point, which is the same trade PP-01's walk explicitly refused
+  when it declined to add a post-DNAT egress exception.
+
+  The instrumentation label is also a blind spot worth stating
+  ------------------------------------------------------------
+  `role = instrumentation` is a lab annotation, not a property of the traffic. A
+  compromised sensor produces byte-identical flows and would be suppressed by
+  any rule that filters on that field. PP-02 is what makes that reachable: the
+  sensor is the only pod permitted to touch all three business workloads. So the
+  exclusion is correct for this lab and wrong in the exact case that matters most,
+  and an operator porting this rule should drop the exclusion and accept the
+  false positives instead.
+
+  A network-graph SOC will not see this technique at all
+  ------------------------------------------------------
+  Phase 6 derived 6 open paths of 25 modelled and confirmed all 25 against the
+  datapath. A connection along one of those 6 edges is expected traffic by that
+  graph's own definition, so reachability analysis is blind to remote service use
+  by an actor already inside a permitted path -- which is most of the interesting
+  cases.
+author: ZeroTrust-SOC-Lab
+references:
+  - https://attack.mitre.org/techniques/T1021/
+logsource:
+  product: zerotrust-soc-lab
+  category: kubernetes
+  schema: network/observed-flow/v1
+detection:
+  sel:
+    schema: network/observed-flow/v1
+
+    # lab-zone excludes cluster-internal control-plane and CNI traffic, which is
+    # 166 of the 170 observed flows and none of which is lab zone crossing.
+    scope: lab-zone
+
+  condition: sel
+fields:
+  - scope
+  - source.name
+  - source.pod
+  - source.role
+  - source.serviceAccount
+  - dest.name
+  - destPort
+  - state
+  - role
+falsepositives:
+  - The telemetry sensor's own health probes to the three business workloads,
+    which PP-02 grants deliberately. Filter on `source.role = instrumentation`
+    in this lab, and read the caveat in the description before doing so
+    anywhere else.
+level: low
+tags:
+  - attack.t1021

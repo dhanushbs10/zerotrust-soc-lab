@@ -1,0 +1,73 @@
+title: Egress denied repeatedly by a NetworkPolicy on one pod
+id: 03170000-0000-4000-8000-000000000005
+status: experimental
+description: |
+  A pod's firewall chain recorded refused packets since the previous collection,
+  and the counter was genuinely comparable to the one before it.
+
+  Why baselineState is in the predicate
+  -------------------------------------
+  This is a counter, not a flow log, so the collector cannot see a destination
+  and can only report a delta. kube-router v2.6.1 rebuilds a chain when its
+  policy set changes, and a node reboot zeroes the counters, and either event
+  makes a subtraction meaningless. The collector models four states for exactly
+  this reason and emits a delta only when the state is `compared`.
+
+  Matching on `deniedPackets > 0` without requiring `compared` would fire on
+  every chain in the cluster immediately after a restart, because the absolute
+  counter is non-zero on any pod that has ever been refused. That is a rule that
+  fires on a reboot.
+
+  What the number means
+  ---------------------
+  `packetsPerRefusal` is measured at 2 per refused connection attempt, and
+  retries to an already-refused pod IP and port are counted again. So the delta
+  approximates connection *attempts*, not distinct flows, and a delta of 2 is one
+  refused connection rather than two. A single refusal is a misconfiguration;
+  a sustained delta is scanning.
+
+  The limitation is stated rather than papered over: the enforcement point
+  records neither port nor destination, so this rule identifies *which pod* was
+  refused and cannot say what it was reaching for.
+author: ZeroTrust-SOC-Lab
+references:
+  - https://attack.mitre.org/techniques/T1046/
+logsource:
+  product: zerotrust-soc-lab
+  category: kubernetes
+  schema: network/denial-counter/v1
+detection:
+  sel:
+    schema: network/denial-counter/v1
+
+  # Only a delta between two comparable chains carries information.
+  sel_compared:
+    baselineState: compared
+
+  sel_denied:
+    counter.deltaDenied|gt: 0
+
+  filter_invalid:
+    deltaValid: false
+
+  # The collector already refuses to emit a delta it does not believe, so this
+  # is belt and braces -- and it is asserted by the test suite, because a
+  # redundant guard that silently stops matching is worse than no guard.
+  condition: sel and sel_compared and sel_denied and not filter_invalid
+fields:
+  - node
+  - chain
+  - subject.namespace
+  - subject.pod
+  - subject.serviceAccount
+  - counter.deniedPackets
+  - counter.deltaDenied
+  - baselineState
+  - policiesApplied
+falsepositives:
+  - A pod whose Service was recreated or whose client is retrying a connection
+    during a rollout. Triage on whether the delta is sustained across several
+    collections rather than appearing once.
+level: medium
+tags:
+  - attack.t1046

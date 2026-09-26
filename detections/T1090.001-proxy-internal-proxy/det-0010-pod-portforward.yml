@@ -1,0 +1,57 @@
+title: Pod port-forward opened against a lab workload
+id: 03170000-0000-4000-8000-000000000010
+status: experimental
+description: |
+  A `pods/portforward` subresource request was granted, relaying traffic from the
+  API server into a running pod's network namespace.
+
+  Why this is its own rule and not a variant of DET-0003
+  -----------------------------------------------------
+  The collector keeps exec, attach and portforward in one schema and routes them
+  to different techniques, so a T1609.001 rule that does not exclude
+  `portforward` will report a tunnel as a container exec. In a cluster where
+  tunnels are rare that misattribution is invisible, which is the argument for
+  the separate rule rather than a filter buried in another one.
+
+  What the tunnel actually bypasses
+  ---------------------------------
+  Phase 6 verified 19 of 25 modelled reachability pairs as dropped by
+  kube-router's policy chain. A port-forward is not one of them: the API server
+  opens the connection from the kubelet into the pod namespace, so no pod-to-pod
+  packet exists for the policy to judge. PP-04 measures both halves in one run --
+  refused directly from the build zone, connected through the relay -- which is
+  the only way to show the control works before showing it does not apply.
+
+  So this rule is not really about tunnels being unusual. It is the only signal
+  this lab emits for a path that the network graph reports as closed.
+author: ZeroTrust-SOC-Lab
+references:
+  - https://attack.mitre.org/techniques/T1090/001/
+logsource:
+  product: zerotrust-soc-lab
+  category: kubernetes
+  schema: runtime/container-exec/v1
+detection:
+  sel:
+    schema: runtime/container-exec/v1
+    subresource: portforward
+
+  sel_granted:
+    granted: true
+
+  condition: sel and sel_granted
+fields:
+  - auditId
+  - target.namespace
+  - target.pod
+  - identity.effectiveIdentity
+  - identity.impersonatedUser
+  - sourceIPs
+  - userAgent
+  - granted
+falsepositives:
+  - Developer `kubectl port-forward` against a lab workload during ordinary
+    debugging. Expected once per PP-04 run in this lab.
+level: medium
+tags:
+  - attack.t1090.001

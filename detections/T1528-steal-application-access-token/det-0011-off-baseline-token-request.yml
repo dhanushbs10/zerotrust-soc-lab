@@ -1,0 +1,67 @@
+title: Service account token requested by something other than a kubelet
+id: 03170000-0000-4000-8000-000000000011
+status: experimental
+description: |
+  A `serviceaccounts/token` request was made by a requester that is neither the
+  kubelet that owns the pod nor a Kubernetes control-plane component.
+
+  Why the requester is the whole predicate
+  ----------------------------------------
+  In this cluster 223 token requests were recorded and 208 of them are one of
+  those two classes. The kubelet requests a token every time it starts a pod,
+  and the controller manager requests them for its own bindings. Those are the
+  floor, not the signal.
+
+  Requiring `requesterClass` in (other, impersonated) is what separates PP-03
+  from routine churn. Without that requirement this rule fires on all 223 and
+  tells an analyst nothing -- which is precisely the mistake the Phase 5
+  registry was built to prevent, after an earlier tagging pass put T1528 on all
+  135 requests including 78 whose own requester was the kubelet running the pod,
+  which is the exact opposite of the rationale printed beside the tag.
+
+  What the credential is worth is not visible here
+  -----------------------------------------------
+  A TokenRequest that is refused is still an event, and a refusal is a real
+  signal: someone asked for authority they did not have. PP-03 measures both
+  directions. Impersonating a low-privilege ServiceAccount is refused, because
+  RBAC is judged as the impersonated identity and `--as` can only reduce
+  authority. Impersonating the `cluster-admin` ServiceAccount succeeds, because
+  that identity holds it.
+
+  The rule does not claim a credential was obtained. Triage has to read
+  `responseCode` to find out which of the two happened.
+author: ZeroTrust-SOC-Lab
+references:
+  - https://attack.mitre.org/techniques/T1528/
+logsource:
+  product: zerotrust-soc-lab
+  category: kubernetes
+  schema: runtime/token-request/v1
+detection:
+  sel_schema:
+    schema: runtime/token-request/v1
+
+  sel_requester:
+    requesterClass:
+      - other
+      - impersonated
+
+  condition: sel_schema and sel_requester
+fields:
+  - auditId
+  - namespace
+  - serviceAccount
+  - identity.effectiveIdentity
+  - identity.impersonatedUser
+  - requesterClass
+  - attestedNode
+  - responseCode
+  - sourceIPs
+falsepositives:
+  - >-
+    An operator or a CI job minting a token for a ServiceAccount it legitimately
+    manages. That is still worth surfacing, because in Kubernetes minting a token
+    for an identity is a privilege operation and is rarely reviewed as one.
+level: high
+tags:
+  - attack.t1528
