@@ -1,0 +1,133 @@
+# The CI build runner. This workload is the lab's headline weakness.
+#
+# PP-01 / T1078.001 / T1098
+# The service account sa-build-runner is bound to cluster-admin (see
+# identities/20-rbac.yaml). The network zone is correctly isolated: no ingress,
+# and egress only to DNS. Note what that means, because it is the lesson:
+#
+#   RBAC and network reach are independent axes. cluster-admin lets you read
+#   every Secret in the cluster and create pods anywhere -- through the API
+#   server, not through pod-to-pod traffic. The network policy stops nothing,
+#   because the attacker never sends a packet to postgres. They ask the API
+#   server for the credential, then open exactly one connection the policy
+#   permits.
+#
+# So the containment in this file is real but partial, and the compensating
+# control in identities/20-rbac.yaml is the one that fails.
+#
+# Why it runs nginx
+# -----------------
+# A CI system exposes an HTTP endpoint that accepts build requests, so this is
+# not a web server bolted onto a CI runner for the sake of the lab. It is the
+# smallest honest stand-in for one: a listener, a health document, and a
+# long-lived process holding a service account token.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: build-runner-nginx-conf
+  namespace: zerotrust-build
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      server_name _;
+
+      location = /health {
+        default_type application/json;
+        return 200 '{"status":"ready","identity":"sa-build-runner","privilege_path":"PP-01"}';
+      }
+
+      location / {
+        default_type application/json;
+        return 501 '{"error":"build submission not implemented in the lab"}';
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: build-runner
+  namespace: zerotrust-build
+  annotations:
+    zerotrust.lab/privilege-path: PP-01
+    zerotrust.lab/attack-id: T1078.001
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: build-runner
+  template:
+    metadata:
+      labels:
+        app: build-runner
+        zerotrust.lab/tier: ci
+    spec:
+      serviceAccountName: sa-build-runner
+      # NOT automountServiceAccountToken: false. The pod needs its token, and
+      # that is the point: the escalation path is live, not theoretical.
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runner
+          image: nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+          # `daemon off;` only. See the note in 10-frontend-and-api.yaml: the
+          # `pid` directive already exists in the image's nginx.conf and passing
+          # it again via -g is a startup error.
+          args:
+            - nginx
+            - -g
+            - daemon off;
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "SETGID", "SETUID"]
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: run
+              mountPath: /var/run
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: conf
+          configMap:
+            name: build-runner-nginx-conf
+        - name: cache
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: build-runner
+  namespace: zerotrust-build
+spec:
+  selector:
+    app: build-runner
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

@@ -1,0 +1,34 @@
+# Namespaces are the lab's trust zones, so they live here alongside the RBAC
+# and NetworkPolicies that define what crosses those zones. Each namespace gets
+# a default-deny network policy in 30-network-policies.yaml, so nothing can talk
+# to anything until a policy explicitly allows it.
+#
+# Apply order matters: this file must land before the workloads, because a
+# Deployment in a namespace that does not exist yet is a confusing failure.
+# `lab.ps1 up` handles the ordering.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zerotrust
+  labels:
+    zerotrust.lab/zone: workload
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zerotrust-build
+  labels:
+    zerotrust.lab/zone: build
+    pod-security.kubernetes.io/enforce: baseline
+---
+# Where telemetry collectors live. Kept apart from the business workloads so
+# that "who is allowed to observe everything" is an explicit, reviewable
+# decision rather than an accident of naming.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zerotrust-observe
+  labels:
+    zerotrust.lab/zone: observe
+    pod-security.kubernetes.io/enforce: restricted

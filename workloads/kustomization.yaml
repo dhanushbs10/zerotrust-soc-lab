@@ -1,0 +1,21 @@
+# The workloads themselves: the fake company's applications and sensors.
+#
+# Applied after identities/ and after cluster\bootstrap\secrets.ps1. The database
+# will not start without Secret/postgres-credentials, and its initContainer
+# blocks on that Secret, so the failure mode of forgetting the secrets step is a
+# postgres pod stuck in Init rather than an error anyone would enjoy reading.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 10-frontend-and-api.yaml
+  - 20-postgres.yaml
+  - 30-build-runner.yaml
+  - 40-telemetry-agent.yaml
+  - 50-configmaps.yaml
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: zerotrust-soc-lab
+      app.kubernetes.io/managed-by: kustomize

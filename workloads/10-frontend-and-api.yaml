@@ -1,0 +1,250 @@
+# The customer-facing site and the internal orders API.
+#
+# These two are the "boring" part of the company, and that is the point: a
+# correct baseline. When something later reaches the database, it did not do so
+# through a hole that was always there.
+#
+# Why nginx for orders-api
+# ------------------------
+# The first version of this workload used `busybox httpd` from an alpine base.
+# It crash-looped, and the reason is worth keeping in mind: alpine's busybox is
+# built without the httpd applet. `busybox httpd` fails with "applet not found",
+# and installing busybox-extras would mean reaching the network from a container
+# whose whole purpose is to be locked down. nginx is already pinned and already
+# in the image cache, so it is both the working choice and the honest one.
+#
+# Why an emptyDir for /var/cache/nginx
+# ------------------------------------
+# readOnlyRootFilesystem is on, which is correct hardening and also means nginx
+# cannot write its temp directories to the container filesystem. The writable
+# paths are mounted explicitly instead of turning hardening off to make the
+# application work. Relaxing a control because a program misbehaves is how
+# controls stop existing.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: web-frontend-content
+  namespace: zerotrust
+data:
+  index.html: |
+    <!doctype html>
+    <html>
+      <head><title>Acme Orders</title></head>
+      <body>
+        <h1>Acme Orders</h1>
+        <p>Internal demo storefront. ZeroTrust-SOC-Lab.</p>
+        <p><a href="http://orders-api.zerotrust.svc.cluster.local:8080/orders">Order feed</a></p>
+      </body>
+    </html>
+---
+# WEAKNESS WP-01: runs as root.
+#
+# No runAsNonRoot, no dropped capabilities, no read-only root filesystem. The
+# container starts as uid 0. If an attacker reaches this container they are root
+# inside it before they exploit anything.
+#
+# The fix is four lines and it is omitted here so there is something real for
+# detection DET-0007 to find. Compare directly against orders-api below, which
+# does all four.
+#
+# Techniques: T1610 Deploy Container, T1611 Escape to Host
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-frontend
+  namespace: zerotrust
+  annotations:
+    zerotrust.lab/weakness: WP-01
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-frontend
+  template:
+    metadata:
+      labels:
+        app: web-frontend
+        zerotrust.lab/tier: frontend
+    spec:
+      serviceAccountName: sa-web-frontend
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: false
+      containers:
+        - name: nginx
+          image: nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+          ports:
+            - containerPort: 80
+              name: http
+          volumeMounts:
+            - name: content
+              mountPath: /usr/share/nginx/html
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: run
+              mountPath: /var/run
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: content
+          configMap:
+            name: web-frontend-content
+        - name: cache
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-frontend
+  namespace: zerotrust
+spec:
+  selector:
+    app: web-frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# orders-api stands in for a real internal service. The lab's subject is the
+# platform, not the application logic, so this is a static JSON responder rather
+# than a fabricated business API. What matters is its identity, its RBAC, and the
+# fact that NetworkPolicy governs who may reach it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-api-nginx-conf
+  namespace: zerotrust
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      server_name _;
+
+      # absolute, and outside the root, so a request for /health cannot be
+      # satisfied by a file and be mistaken for a real health signal
+      location = /health {
+        default_type application/json;
+        return 200 '{"status":"healthy","identity":"sa-orders-api","tier":"internal"}';
+      }
+
+      location / {
+        root /www;
+        default_type application/json;
+        add_header X-Served-By "orders-api" always;
+        try_files $uri $uri/ =404;
+      }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-api-content
+  namespace: zerotrust
+data:
+  orders: |
+    {"source":"orders-api","status":"ok","orders":[
+      {"id":1001,"customer":"Acme Ltd","total":4200.00,"status":"shipped"},
+      {"id":1002,"customer":"Globex","total":1180.50,"status":"pending"},
+      {"id":1003,"customer":"Initech","total":9900.00,"status":"pending"}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-api
+  namespace: zerotrust
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orders-api
+  template:
+    metadata:
+      labels:
+        app: orders-api
+        zerotrust.lab/tier: api
+    spec:
+      serviceAccountName: sa-orders-api
+      automountServiceAccountToken: true
+      # The correct baseline. Compare with web-frontend above.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+          # `daemon off;` only. The `pid` directive already exists in the
+          # image's nginx.conf, and passing it again via -g fails with
+          # `"pid" directive is duplicate`. The default path, /var/run/nginx.pid,
+          # is writable because /var/run is a mounted emptyDir.
+          args:
+            - nginx
+            - -g
+            - daemon off;
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              # nginx needs to change worker identity from the master.
+              add: ["CHOWN", "SETGID", "SETUID"]
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+            - name: content
+              mountPath: /www
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: run
+              mountPath: /var/run
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: conf
+          configMap:
+            name: orders-api-nginx-conf
+        - name: content
+          configMap:
+            name: orders-api-content
+        - name: cache
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-api
+  namespace: zerotrust
+spec:
+  selector:
+    app: orders-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

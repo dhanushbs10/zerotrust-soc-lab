@@ -1,0 +1,59 @@
+# Non-secret configuration. Everything in this file is safe to commit: no
+# credential values, only the names of things and the settings that are meant
+# to be readable.
+#
+# The contrast with secrets/local/ is the point. When a password ends up in a
+# ConfigMap, it is usually not malice, it is convenience: ConfigMaps can be
+# committed, diffed and read by anyone with `get configmaps`, and a Secret
+# would have forced a conversation about handling. weaknesses.yaml catalogues
+# the case where that reasoning won.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orders-api-config
+  namespace: zerotrust
+data:
+  LOG_LEVEL: "info"
+  # Where to find the credential. The value lives in a Secret and is projected
+  # into the pod at runtime, so it is not in git and not in this object.
+  DB_PASSWORD_SECRET: "postgres-credentials"
+  DB_USER: "orders"
+  DB_HOST: "postgres.zerotrust.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "acme"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lab-catalog
+  namespace: zerotrust
+  labels:
+    zerotrust.lab/purpose: documentation
+data:
+  # The weaknesses and privilege paths planted in this lab, in a form the
+  # telemetry agent and the risk graph can both read. Keeping the catalogue in
+  # the cluster means a detection can be checked against ground truth instead of
+  # against someone's memory.
+  weaknesses.yaml: |
+    weaknesses:
+      - id: WP-01
+        name: web-frontend runs as root
+        resource: Deployment/web-frontend
+        attack_id: T1610
+        detection: DET-0007
+      - id: SP-01
+        name: database password duplicated in a ConfigMap
+        resource: ConfigMap/app-config-leak
+        attack_id: T1552.001
+        detection: DET-0002
+      - id: PP-01
+        name: build-runner service account bound to cluster-admin
+        resource: ClusterRoleBinding/build-runner-cluster-admin
+        attack_id: T1078.001
+        detection: DET-0001
+  privileges.md: |
+    PP-01 build-runner holds cluster-admin.
+      Network: isolated, DNS only.
+      Control plane: total. Reads every Secret, creates pods anywhere.
+      Compensating control: none. The isolation and the privilege do not
+      interact, which is why containment fails.

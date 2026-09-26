@@ -14,6 +14,23 @@ repos:
       - id: mixed-line-ending
         args: [--fix=lf]
 
+  # Local hook. `check-yaml` above is not sufficient on its own: it parses
+  # successfully when a `---` separator is missing, because the duplicate
+  # `apiVersion` key it creates is silently discarded. That is how six
+  # NetworkPolicies disappeared from this repo while every other check passed.
+  # This hook rejects duplicate keys outright, so a lost object is a build
+  # failure rather than a missing control nobody notices.
+  - repo: local
+    hooks:
+      - id: lab-yaml-strict
+        name: strict YAML (duplicate keys, digest pins)
+        entry: >-
+          python tools/validate-yaml.py
+          identities workloads cluster
+        language: system
+        pass_filenames: false
+        files: \.(ya?ml)$
+
   - repo: https://github.com/adrienverge/yamllint
     rev: v1.38.0
     hooks:

@@ -1,0 +1,128 @@
+# RBAC: who is allowed to do what.
+#
+# Two rules govern everything in this file.
+#
+#   1. Least privilege. Grant the narrowest verb set that lets the workload do
+#      its job and nothing more. A Role with `get, list, watch` on one named
+#      resource is defensible. A Role with `*` is not.
+#
+#   2. Everything is a privilege path. Any permission beyond what the workload
+#      needs is an attacker's shortcut, and is catalogued as such in
+#      attack/catalog/privilege-paths.md.
+#
+# ---------------------------------------------------------------------------
+# orders-api: read its own config, read the DB credential, nothing else.
+# Genuinely least privilege. This is the example of doing it right.
+# ---------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: orders-api-config-reader
+  namespace: zerotrust
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["orders-api-config"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["postgres-credentials"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: orders-api-config-reader
+  namespace: zerotrust
+subjects:
+  - kind: ServiceAccount
+    name: sa-orders-api
+    namespace: zerotrust
+roleRef:
+  kind: Role
+  name: orders-api-config-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+# ---------------------------------------------------------------------------
+# telemetry-agent: a network sensor with no Kubernetes API permissions at all.
+#
+# An earlier version of this file granted it a read-only ClusterRole covering
+# pods, configmaps, RBAC and networkpolicies. That was removed, and the reason
+# is the more useful part of this file.
+#
+# The permission never worked. Reaching the API server from a pod means
+# connecting to the `kubernetes.default.svc` ClusterIP, and NetworkPolicy
+# evaluates egress after kube-router's service proxy has already DNAT'd that
+# address to the control-plane node on a different port. No policy written
+# against the ClusterIP can match. See the long note in
+# identities/34-networkpolicy-zones.yaml for the packet-level trace.
+#
+# So sa-telemetry-agent held a set of permissions it could not exercise, and
+# could not have used if it tried. Two reasons that is worth removing rather
+# than keeping for later:
+#
+#   1. It is a privilege path. A credential that can read every ConfigMap in
+#      the cluster is worth stealing even if the holder is well behaved, and
+#      PP-01 already demonstrates what an over-privileged token buys an
+#      attacker. Shipping a second one for convenience repeats the mistake the
+#      lab is built to criticise.
+#
+#   2. Unusable permissions are indistinguishable from missing ones during an
+#      incident. Someone debugging why a sensor is not reporting will check
+#      its RBAC, find permissions that look correct, and conclude the network
+#      is at fault. Permissions that cannot be used should not exist.
+#
+# The division of labour this leaves:
+#   in-cluster  -- the agent observes network reachability (33, 34-networkpolicies)
+#   host-side   -- kubectl and telemetry/audit/export-audit-log.ps1 read
+#                  API-level evidence directly, with an operator's credentials
+#                  that are already present and already auditable
+#
+# If a future phase needs an in-cluster collector that reads the API, the
+# correct first step is deriving the control-plane address at apply time and
+# adding a policy that matches it. Granting the RBAC first, and the network
+# path later, inverts the order and produces exactly the dead permission above.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa-telemetry-agent
+  namespace: zerotrust-observe
+# Still mounted, and deliberately. The token grants nothing -- see above -- but
+# it is the sensor's identity, and without it every connection the sensor opens
+# appears in the audit log and the network logs as the same anonymous pod rather
+# than as sa-telemetry-agent. An unattributable sensor is a sensor nobody can
+# trust after an incident.
+automountServiceAccountToken: true
+---
+# ---------------------------------------------------------------------------
+# PRIVERGE PATH PP-01 (the headline weakness of this lab)
+#
+# build-runner holds cluster-admin. One token, total control of the cluster:
+# read every secret, create pods anywhere, run anything as root.
+#
+# Real-world equivalent: a CI job whose service account was granted admin
+# "temporarily" and never revoked. It is the single most common way Kubernetes
+# clusters are fully compromised, and it needs no exploit at all.
+#
+# Attacker technique: T1078.001 Valid Accounts: Default Accounts
+#                     T1098    Account Manipulation
+#
+# The lab keeps this in place deliberately. A detection that has never been
+# tested against a real over-privileged account is a guess.
+# ---------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: build-runner-cluster-admin
+  annotations:
+    zerotrust.lab/privilege-path: PP-01
+    zerotrust.lab/attack-id: T1078.001
+subjects:
+  - kind: ServiceAccount
+    name: sa-build-runner
+    namespace: zerotrust-build
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io

@@ -1,0 +1,23 @@
+# The security model: who exists, what they may do, and what they may talk to.
+#
+# Applied before workloads/ on purpose. A ServiceAccount has to exist before a
+# pod can reference it, and a NetworkPolicy that names a namespace that does not
+# exist yet silently matches nothing -- a deny that denies nothing is worse than
+# no policy, because it looks like a control.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespaces.yaml
+  - 10-serviceaccounts.yaml
+  - 20-rbac.yaml
+  - 31-networkpolicy-default-deny.yaml
+  - 32-networkpolicy-dns.yaml
+  - 33-networkpolicy-workloads.yaml
+  - 34-networkpolicy-zones.yaml
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: zerotrust-soc-lab
+      app.kubernetes.io/managed-by: kustomize

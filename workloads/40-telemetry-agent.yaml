@@ -1,0 +1,152 @@
+# The telemetry agent. This is the lab's own sensor, and it produces real
+# evidence rather than a scripted approximation of it.
+#
+# What it does: every N seconds it opens a TCP connection to each service in the
+# lab and records whether the connection succeeded. Because kube-router enforces
+# NetworkPolicy, "succeeded" and "blocked" are not opinions -- they are the
+# actual enforcement result. When Phase 4 opens a path that should not exist, a
+# probe here flips from blocked to open, and that flip is the detection signal.
+#
+# Its network policy grants egress to 80, 8080, 5432 and 6443 only, so the probe
+# set is chosen to match what it is permitted to test. Probing a port it may not
+# reach would produce a permanent false positive, which is how people end up
+# ignoring their own alerts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telemetry-agent
+  namespace: zerotrust-observe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: telemetry-agent
+  template:
+    metadata:
+      labels:
+        app: telemetry-agent
+        zerotrust.lab/tier: sensor
+    spec:
+      serviceAccountName: sa-telemetry-agent
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -u
+              INTERVAL="${PROBE_INTERVAL_SECONDS:-60}"
+
+              # name|host|port|expected
+              #
+              # `expected` is what identities/33 and /34 say SHOULD happen, so a
+              # mismatch is a policy failure rather than a curiosity.
+              #
+              # The expected value is a conjunction, not a statement about this
+              # pod alone. A connection succeeds only if this namespace's egress
+              # policy allows it AND the destination's ingress policy allows it.
+              # Getting that wrong is the single most common way to misread
+              # NetworkPolicy, and it is why the four entries below are checked
+              # against BOTH files rather than against this one.
+              #
+              #   web-frontend  egress: no rule for observe. ingress: PP-02 grants the sensor.
+              #   orders-api    egress: no rule for observe. ingress: PP-02 grants the sensor.
+              #   postgres      egress: no rule for observe. ingress: PP-02 grants the sensor.
+              #   build-runner  egress: DNS only.        ingress: none at all.
+              #   apiserver     egress: unreachable by any pod policy. kube-router DNATs the
+              #                 ClusterIP to the control-plane node before the policy chain
+              #                 runs, so a rule written against 10.96.0.1:443 can never match.
+              #
+              # PP-02 is the reason the first three succeed. Without those ingress
+              # rules they would all be blocked, and correctly so.
+              #
+              # `apiserver` is expected `blocked` and that is the correct answer, not a
+              # fault. It is probed anyway, because a network sensor that stops
+              # reporting on a target is indistinguishable from a sensor that has
+              # stopped working.
+              PROBES='web-frontend|web-frontend.zerotrust.svc.cluster.local|80|open
+              orders-api|orders-api.zerotrust.svc.cluster.local|8080|open
+              postgres|postgres.zerotrust.svc.cluster.local|5432|open
+              build-runner|build-runner.zerotrust-build.svc.cluster.local|8080|blocked
+              apiserver|kubernetes.default.svc.cluster.local|443|blocked'
+
+              emit() { printf '%s\n' "$1"; }
+
+              emit "{\"event\":\"agent_start\",\"identity\":\"sa-telemetry-agent\",\"interval_seconds\":${INTERVAL}}"
+              emit "{\"event\":\"policy_baseline\",\"source\":\"identities/33-networkpolicy-workloads.yaml + identities/34-networkpolicy-zones.yaml\"}"
+
+              while true; do
+                cycle=$(($(date +%s)))
+                for line in $PROBES; do
+                  [ -z "$line" ] && continue
+                  name=$(printf '%s' "$line" | cut -d'|' -f1)
+                  host=$(printf '%s' "$line" | cut -d'|' -f2)
+                  port=$(printf '%s' "$line" | cut -d'|' -f3)
+                  want=$(printf '%s' "$line" | cut -d'|' -f4)
+
+                  start=$(date +%s%N 2>/dev/null || echo 0)
+                  if nc -w 3 "$host" "$port" </dev/null >/dev/null 2>&1; then
+                    got=open
+                  else
+                    got=blocked
+                  fi
+                  end=$(date +%s%N 2>/dev/null || echo 0)
+
+                  if [ "$got" = "$want" ]; then
+                    verdict=match
+                  else
+                    verdict=MISMATCH
+                  fi
+
+                  # printf with an explicit format string rather than string
+                  # concatenation: the fields stay in order, a missing argument
+                  # becomes a visible %s instead of silently shifting the JSON,
+                  # and the format string wraps under the repo's line limit.
+                  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                  printf '{"event":"reachability","target":"%s","host":"%s","port":%s,"observed":"%s","expected":"%s","verdict":"%s","ts":%s,"cycle":%s}\n' \
+                    "$name" "$host" "$port" "$got" "$want" "$verdict" "$ts" "$cycle"
+                done
+                emit "{\"event\":\"cycle_complete\",\"ts\":$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+                sleep "$INTERVAL"
+              done
+          env:
+            - name: PROBE_INTERVAL_SECONDS
+              value: "60"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 200m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: telemetry-agent
+  namespace: zerotrust-observe
+spec:
+  selector:
+    app: telemetry-agent
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

@@ -12,7 +12,11 @@ rules:
     allowed-values: ["true", "false"]
   indentation:
     spaces: 2
-    indent-sequences: consistent
+    # Always indent block sequences under their key. `consistent` is stricter
+    # on paper and worse in practice: it infers the expected style from the
+    # first sequence in the file, so one vendored manifest using the other
+    # convention turns every rule block in the repo into an error.
+    indent-sequences: true
   empty-lines:
     max: 2
   braces:

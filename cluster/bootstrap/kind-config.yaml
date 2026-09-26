@@ -4,7 +4,7 @@ name: soc-lab
 
 nodes:
   - role: control-plane
-    image: kindest/node:v1.34.0
+    image: kindest/node@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a
     kubeadmConfigPatches:
       - |
         kind: InitConfiguration
@@ -53,7 +53,7 @@ nodes:
         containerPath: /etc/kubernetes/audit
         readOnly: true
   - role: worker
-    image: kindest/node:v1.34.0
+    image: kindest/node@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a
     kubeadmConfigPatches:
       - |
         kind: JoinConfiguration
@@ -61,7 +61,7 @@ nodes:
           kubeletExtraArgs:
             node-labels: "zerotrust.lab/zone=workload,zerotrust.lab/role=worker"
   - role: worker
-    image: kindest/node:v1.34.0
+    image: kindest/node@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8ec94d976dc5a
     kubeadmConfigPatches:
       - |
         kind: JoinConfiguration

@@ -1,0 +1,86 @@
+# DNS egress for every trust zone.
+#
+# Denying all egress means denying name resolution, which looks like a total
+# outage rather than a policy mistake. The temptation is to fix it by allowing
+# all egress, which removes the boundary entirely. This file is the narrow fix:
+# UDP and TCP port 53, to the kube-dns pods, nowhere else.
+#
+# Scoping to `k8s-app: kube-dns` rather than "the whole kube-system namespace"
+# matters. The namespace holds the API server, etcd, the scheduler and the
+# controller managers. A rule that permits all egress to kube-system would let a
+# compromised workload talk to etcd on 2379, which is not DNS and is not
+# something a workload should ever reach.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: zerotrust
+  labels:
+    zerotrust.lab/purpose: trust-boundary
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: zerotrust-build
+  labels:
+    zerotrust.lab/purpose: trust-boundary
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: zerotrust-observe
+  labels:
+    zerotrust.lab/purpose: trust-boundary
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

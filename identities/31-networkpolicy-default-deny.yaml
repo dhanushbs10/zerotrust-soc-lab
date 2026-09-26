@@ -1,0 +1,52 @@
+# Default-deny for every trust zone.
+#
+# A namespace with no NetworkPolicy is a namespace where every pod can talk to
+# every pod. These three objects are the reason that stops being true, and they
+# are deliberately the first thing applied: an allow rule that lands before the
+# deny it modifies produces a window where the boundary does not exist.
+#
+# Egress is denied too. Default-deny-ing only ingress is the most common way to
+# believe a namespace is isolated while it can still reach the database, the
+# metadata service and anything else it cares to call.
+#
+# Enforcement requires kube-router (cluster/networking/kube-router.yaml). Under
+# kind's default kindnet CNI these objects are accepted by the API server, stored
+# faithfully, and never applied to a single packet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: zerotrust
+  labels:
+    zerotrust.lab/purpose: trust-boundary
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: zerotrust-build
+  labels:
+    zerotrust.lab/purpose: trust-boundary
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: zerotrust-observe
+  labels:
+    zerotrust.lab/purpose: trust-boundary
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress

@@ -1,0 +1,186 @@
+# Business-zone flows in the `zerotrust` namespace.
+#
+# Every rule below corresponds to one line of the fake company's architecture, and
+# nothing here is broader than that line needs. If a rule cannot be traced to a
+# specific requirement, it is an over-permission and should be deleted.
+#
+# Permitted:
+#   web-frontend  <- web-frontend, orders-api   on 80
+#   web-frontend  -> orders-api                 on 8080
+#   orders-api    <- web-frontend               on 8080
+#   orders-api    -> postgres                   on 5432
+#   postgres      <- orders-api                 on 5432
+#
+# Not permitted, and the absence is the control:
+#   web-frontend  -> postgres    a web server has no reason to hold a DB session
+#   postgres      -> anywhere    a database that initiates traffic is exfiltrating
+#   orders-api    -> build       the build zone is not on any request path
+#   build-runner  -> zerotrust   see 34-networkpolicy-zones.yaml
+#
+# ---------------------------------------------------------------------------
+# The rule that is easy to forget, and cost this lab an afternoon
+# ---------------------------------------------------------------------------
+# A NetworkPolicy is not a one-sided permission. A connection is allowed only
+# when the SOURCE's egress policy permits it AND the DESTINATION's ingress policy
+# permits it. Both sides must agree.
+#
+# The first version of the telemetry agent reported every service unreachable.
+# Its own egress policy was correct and the policies here were correct. The bug
+# was in the agent's expectation: it assumed its own egress was sufficient and
+# never checked that these ingress rules had not granted it anything.
+#
+# `default-deny-all` denies both directions, so the agent was denied here even
+# though it was permitted by its own namespace. Ingress rules add permissions
+# only for the named pods; they never imply one.
+#
+# That is why observation access is granted explicitly below rather than
+# assumed. PRIVERGE PATH PP-02.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-frontend-ingress
+  namespace: zerotrust
+spec:
+  podSelector:
+    matchLabels:
+      app: web-frontend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web-frontend
+        - podSelector:
+            matchLabels:
+              app: orders-api
+      ports:
+        - protocol: TCP
+          port: 80
+    # PP-02: observation access for the sensor. Scoped to the single
+    # telemetry-agent pod by both namespace and pod selector, so a second pod
+    # dropped into the observe namespace does not inherit it.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              zerotrust.lab/zone: observe
+          podSelector:
+            matchLabels:
+              app: telemetry-agent
+      ports:
+        - protocol: TCP
+          port: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-frontend-egress
+  namespace: zerotrust
+spec:
+  podSelector:
+    matchLabels:
+      app: web-frontend
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: orders-api
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orders-api-ingress
+  namespace: zerotrust
+spec:
+  podSelector:
+    matchLabels:
+      app: orders-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: web-frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+    # PP-02: observation access for the sensor.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              zerotrust.lab/zone: observe
+          podSelector:
+            matchLabels:
+              app: telemetry-agent
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: orders-api-egress
+  namespace: zerotrust
+spec:
+  podSelector:
+    matchLabels:
+      app: orders-api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+  namespace: zerotrust
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: orders-api
+      ports:
+        - protocol: TCP
+          port: 5432
+    # PP-02: observation access for the sensor.
+    #
+    # This is the rule to be most uncomfortable about. It hands the sensor a
+    # network path to the database, which is the asset the whole lab protects.
+    # It is here because a SOC that cannot probe the database cannot tell
+    # "healthy" from "unreachable", and silently losing that distinction is how
+    # an outage becomes an incident.
+    #
+    # The compensating control is that sa-telemetry-agent holds no database
+    # credential. It can open a TCP connection to 5432 and no further, which is
+    # the difference between "can see that the door is open" and "can walk
+    # through it". Removing the credential is what keeps PP-02 survivable.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              zerotrust.lab/zone: observe
+          podSelector:
+            matchLabels:
+              app: telemetry-agent
+      ports:
+        - protocol: TCP
+          port: 5432

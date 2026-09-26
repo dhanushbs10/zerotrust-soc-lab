@@ -1,0 +1,147 @@
+# Zone-level rules: the sensor and the build runner.
+#
+# These two are where the interesting reasoning lives, because both policies are
+# defensible individually and the pair of them is what an attacker has to defeat.
+---
+# telemetry-agent: the one identity permitted to observe the whole lab.
+#
+# Evidence collection requires reach. The agent probes each service on a timer
+# and records whether the connection succeeded, which is only meaningful if it is
+# actually attempting the connection.
+#
+# The ports are enumerated rather than left open because a probe set wider than
+# the policy guarantees permanent false positives, and an alert that is always
+# firing is an alert nobody reads. This list is deliberately equal to what
+# 34's reachability probes attempt.
+#
+# Two properties keep this from being a hole:
+#   - its RBAC (identities/20-rbac.yaml) grants no write verb at all
+#   - nothing is permitted to reach it, so it cannot be used as a pivot
+# Broad read access plus no write access plus no inbound path is a defensible
+# combination. Broad read access plus writes would not be.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: telemetry-agent-egress
+  namespace: zerotrust-observe
+spec:
+  podSelector:
+    matchLabels:
+      app: telemetry-agent
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # An explicit podSelector alongside namespaceSelector.
+        #
+        # The semantically equivalent bare `namespaceSelector: {}` -- "all
+        # pods in all namespaces" -- was tried first and did not work. kube-router
+        # accepted it, stored it, and blocked every connection: the podSelector
+        # is required for it to resolve the rule into a destination IP set.
+        #
+        # Worth knowing because the failure is invisible in review. `kubectl get
+        # networkpolicy` shows a policy that looks correct, and the symptom
+        # appears far away as a sensor that silently reports every service
+        # unreachable. A policy that blocks too much and a policy that is
+        # misconfigured look identical from the outside.
+        - namespaceSelector: {}
+          podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 5432
+# ---------------------------------------------------------------------------
+# Reaching the API server from inside the cluster: not permitted, and the
+# reason is worth more than the rule would have been.
+#
+# The obvious approach is an ipBlock for the service CIDR:
+#
+#     - to: [{ ipBlock: { cidr: 10.96.0.0/12 } }]
+#       ports: [{ port: 443 }]
+#
+# It generates a correct-looking iptables rule and an ipset that genuinely
+# contains 10.96.0.0/12. It still blocks every connection, because of rule
+# ordering inside the kernel rather than anything in the manifest:
+#
+#   1. PREROUTING (nat table) DNATs 10.96.0.1:443 to 172.18.0.3:6443, the
+#      control-plane node. This is kube-router's service proxy doing its job.
+#   2. FORWARD (filter table) then runs the egress policy chain.
+#
+# By step 2 the destination is no longer 10.96.0.1 and the port is no longer
+# 443. Both halves of the rule are stale. The packet arrives at the chain
+# looking like unrelated traffic to a node address on a port nobody opened, and
+# the default-deny correctly drops it.
+#
+# NetworkPolicy evaluates egress AFTER service translation, so a rule that
+# describes the ClusterIP describes an address that no longer exists by the
+# time the rule is consulted. Verified on this cluster:
+#
+#   -A KUBE-SVC-NPX46M4PTMTKRN6Y --comment "default/kubernetes:https
+#        -> 172.18.0.3:6443" -j KUBE-SEP-QKX46M4PTMTKRN6JIY   <- nat, first
+#   -A KUBE-NWPLCY-M3TQCZ... --match-set KUBE-DST-C2N3G7QLO76HMLYM
+#        --dport 443 ...                                        <- filter, second
+#
+# A rule that matches the control-plane node address and port 6443 does work,
+# and it is deliberately absent: that address is assigned to the node at
+# cluster-creation time, so the manifest would encode one machine's topology
+# and fail confusingly on the next one. Deriving it at apply time is the
+# correct fix and is a reasonable later phase.
+#
+# The lab's answer for now: the API server is not a network-observable target.
+# Cluster-state evidence is collected from the host instead, by
+# telemetry/audit/export-audit-log.ps1, which already reads the audit log
+# directly. The in-cluster agent is a network sensor and nothing more, and its
+# RBAC reflects that.
+# ---------------------------------------------------------------------------
+---
+# telemetry-agent: inbound from the observe zone only. No workload in the lab is
+# permitted to reach the sensor, so observing the lab cannot become a stepping
+# stone into it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: telemetry-agent-ingress
+  namespace: zerotrust-observe
+spec:
+  podSelector:
+    matchLabels:
+      app: telemetry-agent
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              zerotrust.lab/zone: observe
+---
+# build-runner: the network half of PP-01 is genuinely locked down.
+#
+# No ingress at all. Egress is DNS only, inherited from 32-networkpolicy-dns.yaml
+# plus the default-deny, and this object adds the explicit ingress refusal.
+#
+# The important thing to understand is what this does and does not achieve. It
+# stops the build zone from reaching the business zone, and it stops anything
+# from reaching the build runner. It does NOT limit sa-build-runner's
+# cluster-admin binding, because control-plane access is not network traffic
+# between pods: the attacker authenticates to the API server on 6443, reads
+# Secret/postgres-credentials, and then opens the one connection the network
+# policy actually permits.
+#
+# So the containment is real but partial, and the compensating control that
+# should have existed -- not granting cluster-admin to a CI job -- is the one
+# that is missing. That is PP-01, and detection DET-0001 exists to catch it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: build-runner-no-ingress
+  namespace: zerotrust-build
+spec:
+  podSelector:
+    matchLabels:
+      app: build-runner
+  policyTypes:
+    - Ingress
+  ingress: []

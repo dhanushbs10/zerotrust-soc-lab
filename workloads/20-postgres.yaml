@@ -1,0 +1,164 @@
+# The customer database. Real PostgreSQL, real data, real credentials.
+#
+# It is the most valuable target in the fake company, which is exactly why it is
+# worth watching. Note what is NOT here: no securityContext loosening, no
+# hostPath, no extra mounts. The database is the well-defended thing, so that
+# when an attacker gets in, the weakness that let them in is unambiguous.
+# Storage comes from volumeClaimTemplates below rather than a standalone PVC.
+# Two PVCs for one database is the kind of thing that works in a lab and
+# confuses everyone in production, where the claim is named after the pod and
+# the volume follows it.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: zerotrust
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+        zerotrust.lab/tier: data
+    spec:
+      serviceAccountName: sa-postgres
+      automountServiceAccountToken: false # a database has no business calling the API server
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70 # postgres uid inside the official alpine image
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres@sha256:721873c34ceb9f8d8fc265984940dc982404c105f19ad51be9fdc5970a6080ea
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_DB
+              value: acme
+            - name: POSTGRES_USER
+              value: orders
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            # Executed once, automatically, only when the data directory is
+            # empty. filename order is the execution order, which is why the
+            # schema is 01- and the data is 02-.
+            - name: seed
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+          resources:
+            requests:
+              cpu: 25m
+              memory: 96Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "orders", "-d", "acme"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "orders", "-d", "acme"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      # Seeding is handled by /docker-entrypoint-initdb.d below, NOT by an
+      # initContainer. The first version of this manifest ran the seed in an
+      # initContainer that waited for postgres to accept connections -- and
+      # initContainers run before the main container, so postgres could never
+      # start and the seed could never succeed. The pod hung in Init:0/1
+      # indefinitely with both halves of the design individually reasonable.
+      #
+      # The official image already solves this properly: on first initialisation
+      # of an empty data directory, docker-entrypoint.sh runs every *.sql in
+      # /docker-entrypoint-initdb.d in filename order, then starts the server.
+      # Using it means the seed is part of initialisation rather than a race.
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: seed
+          configMap:
+            name: postgres-seed
+      terminationGracePeriodSeconds: 30
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: zerotrust
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+# Real seed data, created on first boot. This is what an attacker is after in
+# Phase 4, and it is real rows rather than a placeholder, so the detection
+# output shows genuine customer data leaving the cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-seed
+  namespace: zerotrust
+data:
+  01-schema.sql: |
+    CREATE TABLE IF NOT EXISTS customers (
+      id      SERIAL PRIMARY KEY,
+      name    TEXT NOT NULL,
+      email   TEXT NOT NULL,
+      tier    TEXT NOT NULL DEFAULT 'standard'
+    );
+    CREATE TABLE IF NOT EXISTS orders (
+      id         SERIAL PRIMARY KEY,
+      customer   TEXT NOT NULL,
+      total      NUMERIC(10,2) NOT NULL,
+      status     TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  02-data.sql: |
+    INSERT INTO customers (name, email, tier) VALUES
+      ('Acme Ltd',   'ap@acme.example',   'enterprise'),
+      ('Globex',     'ops@globex.example', 'enterprise'),
+      ('Initech',    'buy@initech.example','standard'),
+      ('Umbrella',   'admin@umbrella.example','standard')
+      ON CONFLICT DO NOTHING;
+    INSERT INTO orders (customer, total, status) VALUES
+      ('Acme Ltd', 4200.00,  'shipped'),
+      ('Globex',   1180.50, 'pending'),
+      ('Initech',  9900.00, 'pending'),
+      ('Umbrella', 75.25,   'refunded')
+      ON CONFLICT DO NOTHING;
