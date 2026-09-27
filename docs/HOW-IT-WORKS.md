@@ -257,6 +257,67 @@ This took three attempts, and the first two failed in a way that looked healthy:
   and was only ever part of the problem. Six of seven rules kept firing throughout, so the
   run looked green.
 
+### 7.1b The bug that was underneath all of it
+
+Reordering the stages never fixed `det-0005`, and the reason is the most instructive bug in
+this repository.
+
+The collector decided a chain had been rebuilt by **comparing the iptables chain name**:
+
+```powershell
+if ($prior.chain -ne $c.chain) { $baselineState = 'chain-rebuilt' }
+```
+
+Measured, directly: the control-plane's chains were read twice, 30 seconds apart, with no
+traffic and no policy change in between. Three chains, three different names. The workers
+were stable across the same interval. kube-router renames its chains on its own schedule,
+entirely independently of anything the lab does.
+
+So the collector was comparing a **filename** to decide whether the **rules** had changed,
+and answering "yes" every single time. `chain-rebuilt` was reported for all 8 subjects on
+every comparison, `deltaDenied` was always `null`, and `det-0005` was permanently
+unjudgeable — no amount of reordering would ever have fixed it, because the bug was not
+about timing.
+
+It now stores a `policyFingerprint` — the sorted, joined names of the NetworkPolicies
+actually enforced on the pod — and compares that. A rename that keeps the same policies is
+cosmetic. A *real* rebuild resets the counters to zero, which the existing `counter-reset`
+branch catches from the numbers, and that is the stronger signal anyway.
+
+Measured effect: comparable deltas went from 3 of 8 subjects to 8 of 8, with
+`chain-rebuilt` at zero.
+
+The general lesson, and the reason it is written down at this length: **before assuming a
+measurement is measuring the thing you meant, check what the identifier is actually
+guaranteeing.** A chain name guarantees uniqueness. It does not guarantee stability. The
+difference is invisible until something renames it.
+
+### 7.1c Refused traffic that changes nothing
+
+`tools/generate-refused-traffic.ps1` exists because of the table above: every other source
+of refused traffic in this lab also changes policy, and changing policy is what invalidates
+the baseline.
+
+It reverses every modelled-open edge `A→B` and dials `B→A`, which the policies do not
+permit — using `kubectl exec` into pods that **already exist**. Nothing is created, nothing
+is deleted, no policy is touched, so kube-router's chains stay standing and the delta stays
+computable. Measured: 5 reversed pairs × 3 attempts, 15 refused packets, 0 permitted.
+
+Targets come from the reachability graph rather than a hardcoded list, so they follow the
+trust model instead of silently going stale. Each attempt is classified the way
+`build-reachability.ps1` classifies its own probes — exit code first, so a slow success can
+never be recorded as a drop, then elapsed time measured *inside* the pod from
+`/proc/uptime` against a 600 ms cut. Each source pod gets a TCP connect to kube-dns on 53
+as a positive control, because a pod that cannot reach anything has proved nothing about a
+port.
+
+It also refuses to run against a forward edge, via a guard that throws. That guard exists
+because the first version of the script *did not actually reverse anything* — the comment
+said "reverses each edge" while the code exec'd into the forward source and dialled the
+forward destination. Every attempt came back `PERMITTED` at 0–10 ms, and the script's own
+error banner explained that away as *"the policies are not symmetric"*. A tool bug reported
+in the grammar of a finding, which is worse than a crash because it gets believed.
+
 Worth knowing: `tools/test-boundaries.ps1` could not have been used as the traffic generator
 either, because it creates a probe pod per case. Anyone reaching for it to "generate some
 denied traffic" will silently invalidate the baseline again.
