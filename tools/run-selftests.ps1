@@ -54,12 +54,21 @@ $suites = @(
         why  = 'ATT&CK registry can fail, and maps telemetry to techniques'
         path = Join-Path $projectRoot 'telemetry\test-tag-attack-ids.ps1'
         exe  = 'powershell'
+        args = @()
     }
     [pscustomobject]@{
         name = 'graph/test-reachability-selftest.ps1'
         why  = 'reachability derivation can fail, under mutation'
         path = Join-Path $projectRoot 'graph\test-reachability-selftest.ps1'
         exe  = 'powershell'
+        args = @()
+    }
+    [pscustomobject]@{
+        name = 'tools/scan-pods.ps1 -SelfTest'
+        why  = 'the pod inventory check can report drift, in both directions'
+        path = Join-Path $projectRoot 'tools\scan-pods.ps1'
+        exe  = 'powershell'
+        args = @('-SelfTest')
     }
     [pscustomobject]@{
         name = 'detections/engine/test_sigmalite.py'
@@ -111,7 +120,8 @@ foreach ($s in $suites) {
         & python $s.path 2>&1 | ForEach-Object { Write-Host ("      {0}" -f $_) -ForegroundColor DarkGray }
     }
     else {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $s.path 2>&1 |
+        $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $s.path) + @($s.args)
+        & powershell @argv 2>&1 |
             ForEach-Object { Write-Host ("      {0}" -f $_) -ForegroundColor DarkGray }
     }
     $code = $LASTEXITCODE
