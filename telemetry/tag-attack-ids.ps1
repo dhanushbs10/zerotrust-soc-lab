@@ -90,7 +90,23 @@
 param(
     [string]$NetworkEvents,
     [string]$RuntimeEvents,
-    [string]$ReportPath
+    [string]$ReportPath,
+    # Emit just the registry -- schema -> allowed techniques -- as JSON, and stop.
+    #
+    # This exists because attack/chain-purple-team.ps1 used to keep its own
+    # hardcoded copy of "which techniques have a telemetry schema behind them"
+    # and check the chain's hops against that. The copy was one schema behind:
+    # runtime/object-create/v1 was added, T1078.001 became detectable, and the
+    # chain kept printing "NO SCHEMA, NOT DETECTABLE: T1078.001" and writing it
+    # into .telemetry/chain-summary.json. Nothing was wrong with the schema and
+    # nothing was wrong with the hop; a list of the truth had quietly become a
+    # copy of an older truth.
+    #
+    # This is the same failure the registry itself was written to prevent, one
+    # level up: a mapping duplicated in two files is a mapping that will disagree.
+    # So the chain reads this file, and there is exactly one place where the set
+    # of detectable techniques is written down.
+    [string]$EmitRegistryPath
 )
 
 Set-StrictMode -Version 2
@@ -149,6 +165,10 @@ $KnownTechniques = @(
     [pscustomobject]@{
         id = 'T1046'; name = 'Network Service Scanning'
         basis = 'direct: repeated connection attempts to ports the policy refuses is service scanning'
+    }
+    [pscustomobject]@{
+        id = 'T1078.001'; name = 'Valid Accounts: Default Accounts'
+        basis = 'direct: the catalogue already claims T1078.001 for PP-01, and PP-01''s escalation step is exactly this -- a valid account used to place a workload where the creator''s own policy does not apply'
     }
     [pscustomobject]@{
         id = 'T1090.001'; name = 'Proxy: Internal Proxy'
@@ -224,6 +244,21 @@ $SchemaRegistry = @(
         exemptions = @()
     }
     [pscustomobject]@{
+        schema = 'runtime/object-create/v1'
+        coverage = 'conditional'
+        allowed = @('T1078.001')
+        exemptions = @(
+            [pscustomobject]@{
+                id = 'machine-created'
+                basis = 'The pod was created by a controller, the scheduler or a kubelet, which is how a healthy cluster creates pods. Measured: of 183 pod creates, 24 are the kubelet, 19 are a workload controller and 13 are another service account -- 56 in total, against 127 created directly by an operator identity. Tagging all 183 would put T1078.001 on every replica the cluster has ever rolled, and the tag''s own rationale would be refuted by its data.'
+                test = {
+                    param($e)
+                    @('kubelet', 'workload-controller', 'service-account', 'control-plane-component') -contains (Get-Prop $e 'creatorClass')
+                }
+            }
+        )
+    }
+    [pscustomobject]@{
         schema = 'runtime/pod-log-read/v1'
         coverage = 'always'
         allowed = @('T1552.001')
@@ -277,6 +312,29 @@ function Add-Failure {
 
 $script:rows = New-Object System.Collections.ArrayList
 $script:unexercised = New-Object System.Collections.ArrayList
+
+# --- emit registry and stop ---------------------------------------------------
+
+if ($EmitRegistryPath) {
+    $techniqueSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    $map = [ordered]@{}
+    foreach ($s in $SchemaRegistry) {
+        $map[$s.schema] = @($s.allowed)
+        foreach ($t in @($s.allowed)) { [void]$techniqueSet.Add([string]$t) }
+    }
+    $payload = [pscustomobject]@{
+        generatedFrom = 'telemetry/tag-attack-ids.ps1 $SchemaRegistry'
+        schemas        = $map
+        techniques     = @($techniqueSet | Sort-Object)
+    }
+    $json = (($payload | ConvertTo-Json -Depth 6) -replace "`r`n", "`n") + "`n"
+    $dir = Split-Path -Parent $EmitRegistryPath
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [System.IO.File]::WriteAllText($EmitRegistryPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host ("registry written to {0} ({1} schema(s), {2} technique(s))" -f `
+        $EmitRegistryPath, $SchemaRegistry.Count, $techniqueSet.Count)
+    return
+}
 
 # --- load ------------------------------------------------------------------
 

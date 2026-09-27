@@ -1,0 +1,86 @@
+title: Pod created directly by a client identity, excluding this lab's own probes
+id: 03170000-0000-4000-8000-000000000012
+status: experimental
+description: |
+  A pod object was created by a client identity with no controller in the path,
+  which is what an operator does by hand and what an attacker holding
+  cluster-admin does.
+
+  Why creatorClass is the predicate
+  ---------------------------------
+  A healthy cluster creates pods constantly. Measured: 183 pod creates, of which
+  24 are the kubelet, 19 are a workload controller (replicaset, statefulset,
+  daemonset) and 13 are another service account. 56 in total, none of which is
+  privilege use by anything. The remaining 127 were created directly by an
+  operator identity with no controller in between.
+
+  Keying on the identity string would mean hardcoding a list of control-plane
+  component names, which is a rule that breaks when a component is renamed and
+  fires on everything when it is not. The collector classifies the creator into
+  creatorClass instead, and this rule matches the class.
+
+  The instrumentation exclusion, and its weakness
+  -----------------------------------------------
+  Of those 127 operator-created pods, 114 are graph/build-reachability.ps1's own
+  probe pods and only 13 are the chain's foothold. Without the exclusion this
+  rule is a rule that mostly detects the lab testing itself -- the same trap
+  `source.role = instrumentation` exists to avoid on network flows, and the
+  reason the Phase 5 ATT&CK mapping is a registry rather than a tagging pass.
+
+  The exclusion is weaker than it looks and the weakness is worth stating. The
+  audit record for a pod create carries no spec, so a label on the probe cannot
+  be seen here; the name prefix is the only thing the event has. An attacker who
+  names their foothold `probe-foo` passes straight through this filter. The
+  collector records which subsystem a probe belongs to in `instrumentation`, so
+  the field says where it came from rather than asserting a verdict, and this
+  rule's exclusion should be read as "this lab's own probes", not as "anything
+  named like a probe is safe".
+
+  What this does not establish
+  ----------------------------
+  Creating a pod is not privilege escalation on its own, and the rule does not
+  claim it was. The escalation is what the pod can then do: a foothold placed
+  inside a trust zone by an identity that the zone's NetworkPolicy does not
+  constrain. Triage belongs on `namespace` and on the identity, not on the fact
+  of creation.
+author: ZeroTrust-SOC-Lab
+references:
+  - https://attack.mitre.org/techniques/T1078/001/
+  - https://attack.mitre.org/techniques/T1190/
+logsource:
+  product: zerotrust-soc-lab
+  category: kubernetes
+  schema: runtime/object-create/v1
+detection:
+  sel_schema:
+    schema: runtime/object-create/v1
+
+  sel_creator:
+    creatorClass:
+      - operator
+      - impersonated
+
+  # The lab's own probes. See the description for why this is a weaker signal
+  # than it looks.
+  filter_instrumentation:
+    isLabInstrumentation: true
+
+  condition: sel_schema and sel_creator and not filter_instrumentation
+fields:
+  - timestamp
+  - namespace
+  - pod
+  - identity.effectiveIdentity
+  - creatorClass
+  - instrumentation
+  - decision
+  - responseCode
+  - userAgent
+falsepositives:
+  - An operator applying a manifest by hand, which is the normal way this lab is
+    built and driven. In this cluster the operator identity is the one doing the
+    attacking, so the rule cannot separate the two by identity and does not try.
+  - Anything that runs `kubectl run` or `kubectl apply` from a workstation.
+level: medium
+tags:
+  - attack.t1078.001

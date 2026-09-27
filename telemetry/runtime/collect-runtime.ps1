@@ -143,6 +143,21 @@ $LogReadTechniques = @(
     }
 )
 
+# Added so T1078.001 stops being undetectable.
+#
+# The chain's hop 5 creates a pod in the business zone with cluster-admin, and
+# Phase 8 reported it as having no rule behind it. The audit event was always
+# there; nothing was collecting it. This is the mapping that lets the new
+# runtime/object-create/v1 schema carry the technique.
+$ObjectCreateTechniques = @(
+    [pscustomobject]@{
+        id = 'T1078.001'
+        name = 'Valid Accounts: Default Accounts'
+        why = 'a pod was created directly by a client identity rather than by a controller, so whoever holds that identity placed a workload of their choosing inside a trust zone'
+        mappingBasis = 'direct: the catalogue already claims T1078.001 for PP-01, and PP-01''s escalation step is exactly this -- cluster-admin used to create a pod where no NetworkPolicy constrains the creator'
+    }
+)
+
 # The three trust zones this lab is about. Anything outside them is cluster
 # plumbing, and an event about kube-system is context rather than lab activity.
 $LabZones = @('zerotrust', 'zerotrust-build', 'zerotrust-observe')
@@ -190,7 +205,58 @@ function Get-AuditLines {
     }
     $lines = @($out)
     Write-Host ("  audit files matched: {0}" -f (& docker exec $cp sh -c "ls -1 $auditGlob" 2>$null | Measure-Object).Count) -ForegroundColor DarkGray
-    return $lines
+
+    # A second prefilter, for events that carry no subresource at all.
+    #
+    # The grep above matches the word "subresource", which the raw audit log only
+    # emits when objectRef actually has one -- exec, attach, portforward, binding,
+    # token. A plain `create` of a pod has none, so it was never read, and the
+    # chain's hop 5 -- creating a pod in the business zone with cluster-admin --
+    # produced no telemetry at all. That is why T1078.001 was undetectable: not
+    # because the audit log lacks the event, but because nothing asked for it.
+    # Measured: 283 pod-touching events were sitting in the log the whole time.
+    #
+    # The pattern is deliberately quote-free. PowerShell strips embedded double
+    # quotes before a native executable sees them, so writing '\"verb\":\"create\"'
+    # hands grep a literal backslash and it dies with "Trailing backslash" -- the
+    # same trap attacklib documents for Invoke-InPod. `resource.:.pods` uses `.`
+    # to stand in for the quotes that cannot survive the boundary, and contains
+    # no glob metacharacter, so the shell passes it through untouched.
+    #
+    # It is broader than "create a pod" on purpose. Narrowing here would mean
+    # more quoting, and the verb and subresource filters are applied in
+    # PowerShell below where they can be read.
+    $createOut = & docker exec $cp sh -c "grep -h resource.:.pods $auditGlob" 2>&1
+    $createLines = @($createOut | Where-Object { $_ -and $_ -notmatch '^grep:' })
+    Write-Host ("  pod-touching lines: {0}" -f $createLines.Count) -ForegroundColor DarkGray
+
+    # The two prefilters OVERLAP, and the union of two overlapping sets is not a set.
+    #
+    # Every pods/exec, pods/log, pods/portforward and pods/binding record has BOTH
+    # a subresource and objectRef.resource "pods", so it matches grep one and grep
+    # two alike. Concatenating the results counts each of those records twice, and
+    # the second collector did exactly that: Phase 7's hit counts went 108 -> 180,
+    # 32 -> 64, 24 -> 48, and the only thing that had changed was the number of
+    # lines being read. A duplicated event is worse than a missing one, because a
+    # missing one is a gap you can see and a duplicate inflates every count that
+    # touches it.
+    #
+    # Deduped on auditID, which is the one field guaranteed unique per record. Lines
+    # without one (an export rather than the live log) fall back to the whole line,
+    # which is correct for JSON -- two identical audit records are the same record.
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $all = New-Object System.Collections.Generic.List[string]
+    $dupes = 0
+    foreach ($l in @($lines + $createLines)) {
+        if (-not $l) { continue }
+        $key = $null
+        if ($l -match '"auditID"\s*:\s*"([^"]+)"') { $key = $Matches[1] }
+        else { $key = $l }
+        if (-not $seen.Add($key)) { $dupes++; continue }
+        $all.Add($l)
+    }
+    Write-Host ("  overlap discarded: {0} duplicate record(s)" -f $dupes) -ForegroundColor DarkGray
+    return $all.ToArray()
 }
 
 # ------------------------------------------------------------------ #
@@ -762,6 +828,182 @@ foreach ($t in $tokenRows) {
                          }
                          else {
                              ('no candidate technique: requesterClass is {0}, which is on the measured baseline of a healthy cluster. Minting a token is not theft, and this is what the kubelet and the control plane are supposed to do' -f $class)
+                         }
+    }
+}
+
+# ------------------------------------------------------------------ #
+# direct object creation
+# ------------------------------------------------------------------ #
+
+# Why this schema exists
+# ----------------------
+# The chain's hop 5 creates a pod in the business zone using cluster-admin, and
+# nothing could detect it. The event was never missing from the audit log --
+# `verb=create, resource=pods, responseCode=201, decision=allow` was recorded 283
+# times -- it was missing from *collection*, because the runtime collector
+# prefilters on the word "subresource" and a bare pod create has none.
+#
+# So this closes a collection gap rather than adding a technique. T1078.001 was
+# already declared in the catalogue for PP-01 and declared undetectable in Phase 8;
+# this is the change that makes the declaration false.
+#
+# Who created the pod is the discriminator
+# -----------------------------------------
+# A healthy cluster creates pods constantly, and nearly all of it is machinery:
+# system:replicaset-controller for a Deployment, system:statefulset-controller
+# for the database. Those are the baseline. What is not the baseline is a pod
+# created *directly* by an operator or client identity -- no controller in the
+# path -- which is what an attacker with cluster-admin does, and what an operator
+# does when they run kubectl by hand.
+#
+# The distinction is recorded as creatorClass rather than left as a raw username,
+# for the same reason requesterClass exists on token requests: a rule that
+# hardcodes a list of controller names is a rule that breaks when a control-plane
+# component is renamed, and fires on everything when it is not.
+
+function Get-CreatorClass {
+    param([string]$Creator, [bool]$Impersonated)
+    if ($Impersonated) { return 'impersonated' }
+    if (-not $Creator) { return 'other' }
+    # The real names are system:serviceaccount:kube-system:replicaset-controller
+    # and friends, not system:replicaset-controller. The first version of this
+    # function matched the short form, so every controller in the cluster fell
+    # through to 'service-account' -- which happened to still be off-baseline-
+    # enough not to tag, but for the wrong reason and with a class name that
+    # describes nothing.
+    if ($Creator -match '^system:serviceaccount:kube-system:(replicaset|statefulset|daemonset|job)-controller$') { return 'workload-controller' }
+    if ($Creator -match '^system:(kube-)?scheduler$') { return 'control-plane-component' }
+    if ($Creator -match '^system:node:') { return 'kubelet' }
+    if ($Creator -match '^system:serviceaccount:') { return 'service-account' }
+    if ($Creator -match '^system:') { return 'control-plane-component' }
+    return 'operator'
+}
+
+$createRows = @()
+foreach ($line in $auditLines) {
+    # $auditLines holds raw JSON STRINGS. They must be parsed before anything can
+    # read a field off them.
+    #
+    # The first version of this block assumed otherwise and read .verb straight
+    # off the string: all 19709 records came back with no verb, the filter
+    # rejected every one, and the schema emitted zero events while the collector
+    # reported success. Before that it read a leaked $isRaw from another loop,
+    # and before that its controller regex did not match the real component
+    # names. Three wrong turns, each presenting as "no data" and none of them
+    # saying so -- which is why the only way through was to print the counters.
+    #
+    # ConvertTo-NormalizedAudit takes the PARSED record, and its output does not
+    # carry verb or decision, so both are read from the record itself.
+    $rec = $null
+    try { $rec = $line | ConvertFrom-Json } catch { continue }
+    if ($null -eq $rec) { continue }
+
+    $verb = Get-PropOrNull $rec 'verb'
+    if ($verb -ne 'create') { continue }
+
+    $N = ConvertTo-NormalizedAudit $rec
+    if ($null -eq $N) { continue }
+    if ($N.resource -ne 'pods') { continue }
+    # pods/binding is the scheduler claiming a pod for a node. It is a different
+    # event with a different actor and is already visible as a subresource; leaving
+    # it out here keeps this schema to "a pod object was created".
+    if ($N.subresource) { continue }
+    $createRows += [pscustomobject]@{ rec = $rec; n = $N }
+}
+
+foreach ($row in $createRows) {
+    $rec = $row.rec
+    $N = $row.n
+    $ts = $N.timestamp
+    $code = $N.code
+    $ns   = $N.namespace
+    $name = $N.name
+    $auth = $N.authenticatedUser
+    $imp  = $N.impersonatedUser
+    $dec  = if ($N.isRaw) { Get-PropOrNull (Get-PropOrNull $rec 'annotations') 'authorization.k8s.io/decision' } else { Get-PropOrNull $rec 'decision' }
+    # The normalized record carries sourceIPs (an array), not sourceIP. Reading the
+    # singular form throws under StrictMode, which is a loud failure and a welcome
+    # one -- but it aborts the whole schema, so it is worth being explicit.
+    $src  = @($N.sourceIPs) -join ','
+    $crea = $N.effectiveIdentity
+    $class = Get-CreatorClass -Creator $crea -Impersonated ([bool]$imp)
+
+    # Lab instrumentation, labelled rather than suppressed.
+    #
+    # Measured: 183 pod creates, 127 of them by an operator identity. Of those
+    # 127, 114 are graph/build-reachability.ps1's own probe pods (`probe-*`) and
+    # only 13 are the chain's foothold (`exfil-*`). A rule that fires on all 127
+    # would be a rule that mostly detects this lab testing itself -- the same
+    # trap `source.role = instrumentation` exists to avoid on flows, and the
+    # reason the Phase 5 registry is a registry rather than a tagging pass.
+    #
+    # The audit record has no pod spec, so a label on the probe cannot be seen
+    # here; the name prefix is the only thing the event carries. That is a weaker
+    # signal than a label and is recorded as such: an attacker who names their
+    # foothold `probe-foo` would be filtered by a rule that trusts this field.
+    # The field therefore says which subsystem's probe it is, and the rule's own
+    # description carries the caveat, rather than the collector quietly deciding
+    # what is and is not an attack.
+    $instrumentation = $null
+    if ($name -like 'probe-*') { $instrumentation = 'graph/build-reachability.ps1' }
+    elseif ($name -like 'probe-timing*' -or $name -like 'probe-telemetry-agent*') { $instrumentation = 'phase 6 timing probes' }
+
+    # Only 'operator' and 'impersonated' are off the measured baseline. Tagging
+    # all of them would put a T1078.001 candidate on every replica the cluster has
+    # ever rolled -- 183 pod creates, 127 of which are the operator and 56 of
+    # which are controllers -- which is the same mistake the token-request schema
+    # documents at length: a tag whose condition its own data refutes.
+    $tagged = if ($class -eq 'operator' -or $class -eq 'impersonated') { $ObjectCreateTechniques } else { @() }
+    $tagged = [object[]]@($tagged)
+    $interpretation = switch ($class) {
+        'workload-controller'  { 'a controller creating a pod for a Deployment, StatefulSet or DaemonSet; the expected baseline' }
+        'control-plane-component' { 'the scheduler recording its claim on a pod; not the pod being created' }
+        'service-account'      { 'a workload creating a pod in its own namespace; rare and worth a look' }
+        'impersonated'         { 'created under an impersonated identity, so the creator is not the identity that will be judged for it' }
+        default                { 'a pod created directly by a client identity with no controller in the path. This is what an operator does by hand and what an attacker holding cluster-admin does' }
+    }
+
+    $events += [pscustomobject]@{
+        schema        = 'runtime/object-create/v1'
+        collectedAt   = $collectedAt
+        auditId       = Get-PropOrNull $rec 'auditID'
+        timestamp     = $ts
+        stage         = Get-PropOrNull $rec 'stage'
+
+        verb          = 'create'
+        resource      = 'pods'
+        namespace     = $ns
+        pod           = $name
+        isLabNamespace = ($LabZones -contains $ns)
+
+        identity      = [pscustomobject]@{
+            effectiveIdentity = $(if ($imp) { $imp } else { $auth })
+            authenticatedUser = $auth
+            impersonatedUser  = $imp
+            impersonated      = [bool]$imp
+        }
+        creatorClass  = $class
+        instrumentation = $instrumentation
+        isLabInstrumentation = [bool]$instrumentation
+        sourceIPs     = @($src)
+        userAgent     = Get-PropOrNull $rec 'userAgent'
+        responseCode  = $code
+        decision      = $dec
+        granted       = ($code -eq 201)
+
+        interpretation = $interpretation
+        resolution    = 'the audit log records that the object was created, by whom, and whether RBAC allowed it. It does not record the pod spec, so what the pod was told to do is not in this event; the workload-identity schema carries the spec for pods that still exist'
+
+        candidateTechniques = $tagged
+        note          = if ($instrumentation) {
+                             ('candidate technique, not a detection. This pod was created by {0}, which is this lab''s own instrumentation, so a rule that fires here is mostly detecting the lab testing itself' -f $instrumentation)
+                         }
+                         elseif ($class -eq 'operator' -or $class -eq 'impersonated') {
+                             'candidate technique, not a detection. Firing is Phase 7.'
+                         }
+                         else {
+                             ('no candidate technique: creatorClass is {0}, which is how the cluster creates pods on its own. Creating a pod is not privilege use by itself' -f $class)
                          }
     }
 }

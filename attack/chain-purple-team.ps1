@@ -342,7 +342,34 @@ foreach ($h in $script:chain) { Write-Host ("    {0}  {1,-10} {2}" -f $h.id, $h.
 
 # Coverage is computed, not asserted. A hop whose technique has no telemetry
 # schema behind it cannot be detected, and saying so is the point of the phase.
-$registryTechniques = @('T1021', 'T1046', 'T1090.001', 'T1528', 'T1552.001', 'T1609.001')
+#
+# The set of detectable techniques is READ, never written here. This used to be a
+# hardcoded list, and it was quietly a copy of an older registry: when
+# runtime/object-create/v1 made T1078.001 detectable, the schema landed and a
+# Phase 7 rule started firing on the chain's hop 5, and this script went on
+# printing "NO SCHEMA, NOT DETECTABLE: T1078.001" and recording it in
+# .telemetry/chain-summary.json. Nothing had broken. A list of the truth had
+# become a list of a former truth, which is the exact failure the ATT&CK registry
+# exists to prevent, one level up.
+#
+# So the registry is the single source, asked for its own contents.
+$script:chainProjectRoot = Split-Path $PSScriptRoot -Parent
+$registryPath = Join-Path $script:chainProjectRoot '.telemetry\attack-registry.json'
+& powershell -NoProfile -ExecutionPolicy Bypass `
+    -File (Join-Path $script:chainProjectRoot 'telemetry\tag-attack-ids.ps1') `
+    -EmitRegistryPath $registryPath | Out-Null
+
+$registryTechniques = @()
+if (Test-Path $registryPath) {
+    $registryTechniques = @((Get-Content $registryPath -Raw | ConvertFrom-Json).techniques)
+}
+if ($registryTechniques.Count -eq 0) {
+    # Loud rather than empty. An empty set would make every hop "undetectable",
+    # which is a report that looks like a catastrophic regression and is really
+    # a missing file.
+    throw "could not read the ATT&CK registry from $registryPath. Coverage cannot be computed without it, and guessing would report every hop as undetectable."
+}
+
 $hopTechniques = @($script:chain | ForEach-Object { $_.attackId } | Sort-Object -Unique)
 $undetectable = @($hopTechniques | Where-Object { $registryTechniques -notcontains $_ })
 Write-Host ''

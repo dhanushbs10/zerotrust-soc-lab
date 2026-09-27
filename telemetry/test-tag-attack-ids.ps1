@@ -63,6 +63,8 @@ $validRuntime = @'
 {"schema":"runtime/pod-log-read/v1","candidateTechniques":[{"id":"T1552.001","name":"Unsecured Credentials: Credentials In Files"}],"pod":"orders-api-1"}
 {"schema":"runtime/token-request/v1","requesterClass":"kubelet","candidateTechniques":[]}
 {"schema":"runtime/workload-identity/v1","serviceAccount":"sa-orders-api","candidateTechniques":[]}
+{"schema":"runtime/object-create/v1","creatorClass":"operator","candidateTechniques":[{"id":"T1078.001","name":"Valid Accounts: Default Accounts"}],"pod":"exfil-1"}
+{"schema":"runtime/object-create/v1","creatorClass":"kubelet","candidateTechniques":[],"pod":"nginx-abc"}
 '@
 
 $smuggledSchema = '{"schema":"runtime/smuggled/v1","candidateTechniques":[{"id":"T1609.001"}]}'
@@ -99,13 +101,43 @@ $cases = @(
         expect = 1
     }
     [pscustomobject]@{
+        name = 'untagged pod create by an operator identity'
+        net = $validNetwork
+        # creatorClass is the discriminator for runtime/object-create/v1, so an
+        # operator-created pod with no tag is exactly the gap the exemption exists
+        # to close. Without this case the new exemption could be widened to
+        # "always exempt" and the suite would still pass.
+        rt = $validRuntime.Replace(
+            '{"schema":"runtime/object-create/v1","creatorClass":"operator","candidateTechniques":[{"id":"T1078.001","name":"Valid Accounts: Default Accounts"}],"pod":"exfil-1"}',
+            '{"schema":"runtime/object-create/v1","creatorClass":"operator","candidateTechniques":[],"pod":"exfil-1"}')
+        expect = 1
+    }
+    [pscustomobject]@{
+        name = 'untagged pod create whose creatorClass the registry has never heard of'
+        net = $validNetwork
+        # The exemption is an explicit list, not a catch-all, and this is the case
+        # that says so. An earlier version of this test used
+        # "replicaset-controller" as the un-exempt class and expected a pass; the
+        # checker correctly rejected it, because that string is a component NAME
+        # and creatorClass only ever contains workload-controller. A test written
+        # from an assumption about the data rather than from the data is a test
+        # that fails for the wrong reason, and the failure looked like a bug in the
+        # checker when it was a bug in the expectation.
+        #
+        # What it actually protects: if the exemption were ever weakened to
+        # "anything that is not operator", a new or misspelt creatorClass would
+        # silently pass as benign. Here it is reported instead.
+        rt = $validRuntime.Replace('"creatorClass":"kubelet"', '"creatorClass":"some-class-from-the-future"')
+        expect = 1
+    }
+    [pscustomobject]@{
         name = 'empty input file'
         net = $validNetwork
         rt = ''
         expect = 1
     }
     [pscustomobject]@{
-        name = 'all six schemas present and correctly tagged'
+        name = 'all seven schemas present and correctly tagged'
         net = $validNetwork
         rt = $validRuntime
         expect = 0
