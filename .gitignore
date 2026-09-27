@@ -56,6 +56,17 @@ local/
 .audit/
 .telemetry/
 
+# An empty .gitleaks/ directory. gitleaks looks here for a custom ruleset and falls
+# back to its stock defaults when there is none -- and it cannot tell the
+# difference between "no config" and "an empty directory that looks like config".
+# The directory is currently empty and untracked, so it is invisible to git status
+# and to every clone, but it reappears wherever a tool creates it, and the next
+# person to see it will reasonably assume a tuned ruleset is in force when it is
+# not. Ignored, so it cannot mislead anyone.
+#
+# If a real gitleaks config is ever written, delete this line in the same commit.
+.gitleaks/
+
 # Local overrides
 *.local.yaml
 *.local.yml
