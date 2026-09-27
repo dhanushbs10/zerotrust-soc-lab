@@ -88,6 +88,18 @@ $suites = @(
         path = Join-Path $projectRoot 'dashboard\test_server.py'
         exe  = 'python'
     }
+    [pscustomobject]@{
+        # Needs a snapshot rather than a cluster, which is why it belongs here and
+        # not only in run-lab.ps1: `.telemetry/posture-snapshot.json` is a file, so
+        # the posture checks can be proven to fail on a machine with no cluster at
+        # all. Without that, the five posture checks would only be exercised by the
+        # one command that talks to a cluster, which is exactly the arrangement the
+        # audit found the console's security suites were in.
+        name = 'detections/posture/test_posture.py'
+        why  = 'posture checks notice a real violation, stay quiet on a false positive, and are gated'
+        path = Join-Path $projectRoot 'detections\posture\test_posture.py'
+        exe  = 'python'
+    }
 )
 
 $results = @()

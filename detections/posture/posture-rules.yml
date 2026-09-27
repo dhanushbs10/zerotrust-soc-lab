@@ -1,0 +1,274 @@
+# Posture checks: DET-0001, 0002, 0007, 0008, 0009
+#
+# These are a different class of check from detections/*.yml and the difference is
+# worth stating before anything else, because mixing the two would be the easiest
+# mistake to make here.
+#
+# A telemetry rule asks "did this event happen?". A posture check asks "is this
+# configuration acceptable?" -- and it is answered by reading the cluster, not by
+# reading a log. There is no event. There is a RoleBinding, a ConfigMap, a
+# securityContext, a NetworkPolicy, a ServiceAccount. They are read with kubectl,
+# not collected by a collector, and they do not carry a `schema` field because
+# they are not events.
+#
+# So these are NOT Sigma rules and deliberately do not pretend to be. They are
+# declarative rules in this file, evaluated by detections/posture/check_posture.py,
+# gated by a separate harness that proves each one can fail.
+#
+# Every finding in a correctly-built lab is EXPECTED
+# ------------------------------------------------
+# This lab is deliberately vulnerable. `sa-build-runner` holds cluster-admin on
+# purpose, the database password is in a ConfigMap on purpose, and web-frontend
+# sets runAsNonRoot: false on purpose. So "the check fires" is not the gate --
+# every one of these fires in a healthy lab, and a check that fired on nothing
+# would be the broken one.
+#
+# The gate is therefore EXACT SET EQUALITY, in both directions, against the
+# expected findings declared below:
+#
+#   * a finding that is not expected  -> something changed, or the check is loose
+#   * an expected finding that is gone -> a control was removed, or the check broke
+#
+# That is the same shape as tools/scan-pods.ps1, and for the same reason: a
+# one-directional check is a check that cannot notice a control disappearing.
+#
+# What makes these provable
+# -------------------------
+# detections/posture/test_posture.py mutates each rule three ways and requires the
+# gate to object:
+#
+#   vacuous      the predicate is removed          -> must be caught
+#   match-all    the predicate always passes       -> must be caught
+#   inverted     the predicate always fails        -> must be caught
+#
+# The scoping decisions below are all measured, not assumed. The naive version of
+# DET-0001 matches 44 bindings in this cluster, because every kube-system
+# controller binds a service account to its own ClusterRole. A check whose output
+# is 97% cluster plumbing is a check nobody reads.
+
+version: 1
+
+# The namespaces this lab is about. Everything outside is cluster plumbing, and a
+# finding about kube-system is context rather than a lab finding. This is the same
+# reasoning as `scope: cluster-internal` on the network flows.
+labNamespaces:
+  - zerotrust
+  - zerotrust-build
+  - zerotrust-observe
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  - id: DET-0001
+    title: A lab ServiceAccount is bound to a privilege that reaches everything
+    catalogue: attack/catalog/privilege-paths.md (PP-01)
+    technique: T1078.001
+    kind: binding
+    question: >
+      Is a service account in a lab namespace bound to a role granting
+      cluster-admin, or a wildcard verb on secrets?
+    why: >
+      PP-01 is the lab's central deliberate hole: sa-build-runner holds
+      cluster-admin. Detecting it on the BINDING rather than on use means it fires
+      before the attack rather than during it, which is the difference between a
+      posture check and an alert.
+    # Measured, and this is the whole difficulty: 44 ServiceAccount bindings exist
+    # in this cluster and 43 of them are kube-system controllers binding themselves
+    # to their own ClusterRole. Only labNamespaces are considered, which leaves
+    # exactly one finding.
+    scope:
+      subjectNamespaces: labNamespaces
+    predicate:
+      # A roleRef name is matched, not the resolved permission set. Resolving RBAC
+      # properly means implementing role aggregation, and a check that
+      # under-resolves reports a false negative while looking rigorous. So: the
+      # known-overbroad role names, declared explicitly, plus a wildcard-verb
+      # probe on the referenced ClusterRole for the secrets case.
+      roleNames:
+        - cluster-admin
+      # The second half of the catalogue's rule: ANY verb of '*' on secrets, in
+      # any role the lab SA is bound to. This is a genuine permission lookup, not
+      # a name match, and it is why this check reads roles as well as bindings.
+      verbsOnSecrets: '*'
+    expect:
+      # The lab's intended hole, named exactly. A finding here is not a failure.
+      - subject: zerotrust-build/sa-build-runner
+        via: cluster-admin
+
+  # ---------------------------------------------------------------------------
+  - id: DET-0002
+    title: A credential-shaped string is stored in a ConfigMap
+    catalogue: attack/catalog/privilege-paths.md (SP-01)
+    technique: T1552.001
+    kind: configmap
+    question: >
+      Does a lab ConfigMap hold a key or value shaped like a credential?
+    why: >
+      SP-01 exists because the database password is stored twice: once in a Secret
+      and once in a ConfigMap. A Secret has an access-control story attached; a
+      ConfigMap is usually just a value in a file that much of the namespace can
+      read. The ConfigMap copy is the finding.
+    detection: >
+      BY SHAPE, NEVER BY VALUE. The catalogue is explicit about why: a detector
+      that knows the password in order to find the password is not a detector, it
+      is a copy of the secret. So nothing here compares against a known
+      credential, and the test suite proves it by feeding the checker a password it
+      has never seen.
+    scope:
+      subjectNamespaces: labNamespaces
+    predicate:
+      # Matched against the KEY, and against the value only for the structured
+      # connection-string form. Both halves are needed and both are narrow on
+      # purpose.
+      #
+      # Measured: key-shape alone finds DB_PASSWORD and DB_PASSWORD_SECRET. Adding
+      # a loose value pattern finds three more hits -- lab-catalog/privileges.md,
+      # lab-catalog/weaknesses.yaml and web-frontend-content/index.html -- all of
+      # which are PROSE that happens to contain the word "password". Those are
+      # false positives, so the value pattern is restricted to a connection string
+      # that actually carries a credential in it, which is the case DET-0002 exists
+      # to catch and the one the catalogue names (`://` with a password field).
+      keyPatterns:
+        - '(?i)password'
+        - '(?i)passwd'
+        - '(?i)_pwd$'
+        - '(?i)token'
+        - '(?i)secret'
+      valuePatterns:
+        # scheme://user:password@host -- a credential embedded in a URL
+        - '(?i)\w+://[^/\s:@]+:[^/\s:@]+@'
+        # KEY=value, but only for a key that is itself credential-shaped, so that
+        # prose mentioning "password" does not match
+        - '(?im)^\s*(password|passwd|token|secret|api[_-]?key)\s*='
+    expect:
+      - subject: zerotrust/app-config-leak/DB_PASSWORD
+        via: key
+      - subject: zerotrust/app-config-leak/DATABASE_URL
+        via: value
+      - subject: zerotrust/orders-api-config/DB_PASSWORD_SECRET
+        via: key
+
+  # ---------------------------------------------------------------------------
+  - id: DET-0007
+    title: A workload runs with a weaker security context than intended
+    catalogue: attack/catalog/privilege-paths.md (WP-01, SP-01)
+    technique: T1068
+    kind: securityContext
+    question: >
+      Does a lab container omit runAsNonRoot, set it false, run privileged, or
+      hold a capability beyond a small allowlist?
+    why: >
+      This is the check that would notice a container being loosened after the lab
+      was built. Every finding below is intentional; the gate is that the SET of
+      findings does not change.
+    scope:
+      subjectNamespaces: labNamespaces
+    predicate:
+      # A small allowlist, and it is small on purpose. NET_BIND_SERVICE, CHOWN and
+      # SETUID/SETGID are what ordinary images ask for; DAC_OVERRIDE and FOWNER are
+      # the ones worth a second look, and a container holding them can read and
+      # write files it has no business touching.
+      capabilityAllowlist:
+        - CHOWN
+        - SETGID
+        - SETUID
+        - NET_BIND_SERVICE
+        - NET_RAW
+      flags:
+        privilegedTrue: fail
+        runAsNonRootFalse: fail
+        # A MISSING runAsNonRoot is treated as a failure, not as "unset therefore
+        # fine". The container inherits the pod's value if one is set, so the
+        # effective value is pod-then-container, and the check resolves it that way
+        # rather than reading the container key alone. Measured: every lab
+        # container inherits runAsNonRoot from its pod except web-frontend, which
+        # sets it false at the pod level -- an explicit decision, which is exactly
+        # the case the catalogue says a scanner that only looks for a missing key
+        # will not see.
+        missingRunAsNonRoot: fail
+    expect:
+      # Measured, and two of these were wrong in the first draft of this file.
+      #
+      # orders-api adds CHOWN, SETGID and SETUID -- all three are on the
+      # allowlist, so it is NOT a finding. It was listed here on the reasoning that
+      # "it has capabilities so it must trip the capability rule", which is not the
+      # same question. Only postgres adds DAC_OVERRIDE, via its init container
+      # needing to chown its data directory.
+      #
+      # And web-frontend is the runAsNonRoot: false case, which is the one the
+      # catalogue singles out: an explicit false is a decision someone made, and a
+      # scanner that only looks for a missing key will not see it.
+      #
+      # Subjects are workloads, not pods. Pod names carry a ReplicaSet hash
+      # (web-frontend-7cd8cbf8c4-xnwm7) and change on every rollout, so an
+      # expected-findings list keyed on them would need regenerating whenever a
+      # Deployment is rescheduled -- and a list that needs regenerating on a
+      # schedule is a list nobody maintains.
+      - subject: zerotrust/web-frontend
+        via: runAsNonRoot-false
+      - subject: zerotrust/postgres
+        via: capability-DAC_OVERRIDE
+
+  # ---------------------------------------------------------------------------
+  - id: DET-0008
+    title: A NetworkPolicy grants ingress to a pod in the observe zone
+    catalogue: attack/catalog/privilege-paths.md (PP-02)
+    technique: T1190
+    kind: networkpolicy
+    question: >
+      Is there a NetworkPolicy in the observe zone that grants ingress to
+      anything?
+    why: >
+      The observe zone holds the lab's own sensor, not a business workload, so an
+      ingress grant there is not a production concern -- it is a place where a
+      misconfiguration would be invisible, because the sensor is trusted by
+      construction. Fires on the policy, so it is a posture check rather than an
+      attack signal.
+    scope:
+      subjectNamespaces: labNamespaces
+    predicate:
+      # Only policies IN the observe zone that grant ingress. Note this is
+      # deliberately narrower than "a policy that mentions the observe zone":
+      # measured, 4 policies select the observe zone (the sensor's own ingress,
+      # plus orders-api, postgres and web-frontend admitting the sensor, which is
+      # PP-02 working correctly). The catalogue says this check fires exactly once,
+      # and that is the one policy in the observe zone itself. Widening it to
+      # "mentions observe" would turn a correct control into a finding.
+      policyNamespace: zerotrust-observe
+      requireIngressRule: true
+    expect:
+      - subject: zerotrust-observe/telemetry-agent-ingress
+        via: ingress-grant
+
+  # ---------------------------------------------------------------------------
+  - id: DET-0009
+    title: A ServiceAccount has a mounted token and no binding
+    catalogue: attack/catalog/privilege-paths.md (WP-02)
+    technique: T1078
+    kind: serviceaccount
+    question: >
+      Is a lab service account issued a token while holding no RoleBinding at all?
+    why: >
+      The catalogue calls this "cheap, and it catches the common shape of this
+      problem: a token left behind by RBAC that was tightened later". A token with
+      no binding still authenticates, still appears in the audit log, and still
+      costs an analyst time -- so its existence is a finding even though it grants
+      nothing today.
+    scope:
+      subjectNamespaces: labNamespaces
+    predicate:
+      # `default` is excluded, and this is a real exclusion rather than a
+      # convenience. Every namespace has a `default` ServiceAccount, every pod
+      # gets a token for it, and it is never bound to anything. Measured: 6 of the
+      # lab's SAs are unbound and 3 of them are `default`, so including it would
+      # triple the finding count with noise that is true of every cluster in
+      # existence and therefore says nothing about this one.
+      excludeServiceAccounts:
+        - default
+    expect:
+      - subject: zerotrust/sa-postgres
+        via: unbound
+      - subject: zerotrust/sa-web-frontend
+        via: unbound
+      - subject: zerotrust-observe/sa-telemetry-agent
+        via: unbound
