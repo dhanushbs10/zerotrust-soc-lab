@@ -59,6 +59,15 @@
 
 .edge-overlay-group .edge-label {
   font-family: var(--mono, ui-monospace);
+  /* Left at 9.5px, deliberately, unlike the rest of the console's type.
+     These labels are drawn ON the edge lines inside fixed-width SVG zones that
+     are only 337px wide, and cross-zone edges are about 30px long. At 12px the
+     label collided with the port number beside it and overlapped the node
+     cards. Verified by rendering, not by reading the rule.
+
+     This is the exception that proves the rule: legibility is not the only
+     constraint, and a "make all the fonts bigger" pass has to be looked at
+     rather than assumed. */
   font-size: 9.5px;
   letter-spacing: .06em;
   fill: #7c8798;
