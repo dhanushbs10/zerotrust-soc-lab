@@ -303,7 +303,14 @@ function ConvertTo-PodChainRecord {
         if ($r -match 'POD name:(\S+)\s+namespace:\s*([A-Za-z0-9._-]+)') {
             if (-not $podName) { $podName = $Matches[1]; $podNs = $Matches[2] }
         }
-        if ($r -match 'run through nw policy (\S+)') { $policies += $Matches[1] }
+        # The quotes are optional on both sides. kube-router writes the comment as
+        # `run through nw policy "allow-dns-egress"`, and `(\S+)` over-captured the
+        # closing quote -- so every policy name carried a trailing `"` into
+        # policiesApplied and into policyFingerprint. Harmless for comparison, since
+        # both sides are captured the same way, but it made the stored field a lie
+        # about what it contained: policyFingerprint is documented as a sorted join
+        # of policy NAMES, and it was not one.
+        if ($r -match 'run through nw policy\s+"?([^"\s]+)"?') { $policies += $Matches[1] }
         if ($r -match '(-[sd]) (\d+\.\d+\.\d+\.\d+)/32') { $podIps += $Matches[2] }
     }
 
@@ -478,13 +485,46 @@ foreach ($c in $chainRecords) {
     $baselineState = 'no-baseline'
     $deltaInvalidReason = 'no prior collection for this subject'
     if ($prior) {
-        if ($prior.chain -ne $c.chain) {
+        # Rebuild is detected by what is ENFORCED, not by what the chain is called.
+        #
+        # The chain name is a kube-router implementation detail and it is not
+        # stable: measured, the control-plane's chains were renamed between two
+        # reads 30 seconds apart with no traffic and no policy change. Comparing
+        # names therefore reported `chain-rebuilt` for all 8 subjects on every
+        # single comparison, and det-0005 could never be judged -- which reads as
+        # "the telemetry cannot see this" when the truth is "the telemetry was
+        # comparing a filename to decide whether the rules changed".
+        #
+        # The policy set is the semantic content: what is actually being enforced
+        # on this pod. If that is unchanged the delta is meaningful, and if the
+        # chain also reset its counters the `counter-reset` branch below catches
+        # it on the numbers, which is the stronger signal anyway.
+        # Through Get-PropOrNull, never `$prior.policyFingerprint` directly.
+        #
+        # Set-StrictMode -Version 2 makes a bare reference to a property an object
+        # does not have throw, rather than return $null. Every baseline on disk
+        # predates this field, so the direct read threw PropertyNotFoundStrict on
+        # the very first subject and aborted the whole collection -- after reading
+        # all 8 chains and all 190 flows, and before writing anything. A legacy
+        # baseline has to read as "no fingerprint recorded", not as a fatal error.
+        # The guard eleven lines below could not save it because the throw happened
+        # first.
+        $priorPolicies = Get-PropOrNull $prior 'policyFingerprint'
+        $currentPolicies = (@($c.policies | Sort-Object) -join '|')
+        $policiesChanged = ($null -ne $priorPolicies) -and ($priorPolicies -ne $currentPolicies)
+
+        if ($policiesChanged) {
             $baselineState = 'chain-rebuilt'
-            $deltaInvalidReason = 'the iptables chain was regenerated since the baseline, so its counters restarted at zero and are not comparable'
+            $deltaInvalidReason = "the set of NetworkPolicies enforced on this pod changed since the baseline ($priorPolicies -> $currentPolicies), so the counters are not comparable"
         }
         elseif ($absTotal -lt [int64]$prior.total -or $absDenied -lt [int64]$prior.denied) {
+            # Counters going backwards is the real signature of a rebuild that reset
+            # them, and it is detected from the numbers rather than inferred from a
+            # name. A baseline recorded before policyFingerprint existed has none
+            # stored, so it is treated as unchanged here and the backwards-counter
+            # test carries the decision alone.
             $baselineState = 'counter-reset'
-            $deltaInvalidReason = 'counters moved backwards on an unchanged chain, so the previous reading is not a valid starting point'
+            $deltaInvalidReason = 'counters moved backwards since the baseline, which is what a chain rebuild resetting them to zero looks like'
         }
         else {
             $baselineState = 'compared'
@@ -504,6 +544,21 @@ foreach ($c in $chainRecords) {
         key = $key; node = $c.node; chain = $c.chain; podIp = $c.podIp
         pod = $c.podName; namespace = $c.podNs
         total = $absTotal; denied = $absDenied; logged = $absLogged; accepted = $absAccepted
+        # The policy set, sorted and joined, so it can be compared between reads.
+        #
+        # This exists because the chain NAME cannot be. Measured: reading the
+        # control-plane's chains twice, 30 seconds apart, with no traffic and no
+        # policy change, produced three different chain names. kube-router
+        # regenerates the name on its own schedule, so keying rebuild detection on
+        # it reported `chain-rebuilt` for every subject on every comparison, and
+        # det-0005 was permanently unjudgeable through no fault of the rule.
+        #
+        # A rename that keeps the same policies is cosmetic. The thing that can
+        # invalidate a delta is a genuine change to what is enforced -- and that is
+        # what this field captures. A real rebuild also resets the counters to
+        # zero, which the `counter-reset` branch below catches independently, so
+        # the two together still refuse to difference across a real rebuild.
+        policyFingerprint = (@($c.policies | Sort-Object) -join '|')
     }
 
     if (-not $c.identity) { continue }

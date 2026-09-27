@@ -453,6 +453,17 @@ Invoke-Stage 'collect telemetry' {
     # still reports NOT JUDGEABLE after this change, the resync interval is shorter
     # than the privilege paths take, and the honest fix is a dedicated traffic
     # generator run immediately before the read -- not more reordering.
+    #
+    # Hence the generator above, which does exactly that. It reverses every
+    # modelled-open edge and attempts it from the OTHER end, using kubectl exec into
+    # pods that already exist. It creates nothing and deletes nothing, so the chains
+    # kube-router built are still standing and the delta is computable. Every other
+    # refused-traffic source in this lab changes policy, which is the whole reason
+    # the delta kept coming back uncomparable.
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot 'tools\generate-refused-traffic.ps1')
+    if ($LASTEXITCODE -ne 0) {
+        Write-Note 'the generator produced no refused traffic; det-0005 will report NOT JUDGEABLE and that is the truthful result'
+    }
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot 'telemetry\network\collect-network.ps1')
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot 'telemetry\audit\export-audit-log.ps1')
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $projectRoot 'telemetry\runtime\collect-runtime.ps1')
