@@ -36,6 +36,29 @@ logsource:
   product: zerotrust-soc-lab
   category: kubernetes
   schema: network/denial-counter/v1
+  # The precondition this rule needs, declared so the gate can tell "this rule is
+  # broken" apart from "this window cannot judge it".
+  #
+  # Network telemetry here is counter-based, and a counter delta is only defined
+  # when two reads saw the same iptables chain. kube-router rebuilds those chains
+  # whenever policy changes, and it resets the counters to zero when it does. The
+  # collector is explicit about this -- `baselineState: chain-rebuilt`,
+  # `deltaValid: false`, `deltaDenied: null` -- rather than reporting the absolute
+  # count as if it were new traffic, so a rule keying on `deltaDenied > 0` is
+  # correct to match nothing after a policy change.
+  #
+  # That makes a run with no comparable delta a real situation rather than a
+  # hypothetical one, and it happens on any run where the graph stage has just
+  # rebuilt the firewall. Without this declaration the gate reports such a rule as
+  # "matched nothing, which is indistinguishable from working", which is both
+  # wrong and unfixable without lying in one direction or the other.
+  #
+  # This is a precondition on the WINDOW, not a discount on the rule. If a
+  # comparable delta exists, the rule is held to its baseline count and to liveness
+  # like any other, with no exemption available.
+  requires:
+    field: baselineState
+    equals: compared
 detection:
   sel:
     schema: network/denial-counter/v1
