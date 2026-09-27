@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Proves the posture checks can fail. Cluster-free, and run by the pre-commit hook.
+"""Proves the posture checks can fail. Run by the pre-commit hook, and skippable.
 
     python detections/posture/test_posture.py
+
+Needs no CLUSTER -- but it does need `.telemetry/posture-snapshot.json`, which only
+a running cluster can produce and which is gitignored. So on a fresh clone it
+reports a skip with its reason and exits 0, rather than failing. See
+base_snapshot() for why that distinction matters and what it cost to get wrong the
+first time.
 
 Why this file exists
 --------------------
@@ -74,13 +80,29 @@ SNAPSHOT = os.path.join(ROOT, ".telemetry", "posture-snapshot.json")
 UNKNOWN_PASSWORD = "w7Qp-zN4v!tR2xK9mL6cY"  # noqa: S105 - a test fixture, not a credential
 
 
-def base_snapshot() -> dict[str, Any]:
+def base_snapshot() -> dict[str, Any] | None:
+    """The snapshot, or None if it has not been taken yet.
+
+    Returns None rather than raising, and that is a correction. This suite was
+    wired into tools/run-selftests.ps1 on the reasoning that it needs "a snapshot
+    rather than a cluster, so the posture checks can be proven to fail on a
+    machine with no cluster at all".
+
+    The reasoning was inverted. The snapshot is gitignored, so a machine with no
+    cluster is precisely a machine with no snapshot -- it is the file only a
+    running cluster can produce. The result was that a fresh clone hit a red
+    `cluster-free test suites` hook on its first command, inside the hook whose
+    whole job is to block a bad commit. A gate that fails the first time anyone
+    runs it does not get trusted; it gets disabled.
+
+    So an absent snapshot means the posture checks have nothing to judge, and that
+    is reported as a skip with its reason -- neither a pass nor a failure.
+    dashboard/test_server.py already handles the identical situation this way and
+    for the identical reason, and matching it keeps one rule in this repository
+    rather than two.
+    """
     if not os.path.exists(SNAPSHOT):
-        raise SystemExit(
-            f"{SNAPSHOT} not found. Run:\n"
-            f"  python detections/posture/check_posture.py "
-            f"--snapshot .telemetry/posture-snapshot.json"
-        )
+        return None
     with open(SNAPSHOT, "r", encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -397,6 +419,27 @@ def mutate_silently_widened(rule: dict) -> dict:
 # --------------------------------------------------------------------------- #
 def main() -> int:
     snap = base_snapshot()
+    if snap is None:
+        # Exit 0 with a loud reason. Not a silent pass: a suite that reports
+        # nothing and returns 0 is indistinguishable from a suite that ran and
+        # found nothing, and those are very different answers.
+        print("=" * 70)
+        print("posture checks: SKIPPED")
+        print("=" * 70)
+        print()
+        print(f"  {SNAPSHOT} does not exist, so there is no cluster state to judge.")
+        print()
+        print("  This is the expected state on a fresh clone: the snapshot is")
+        print("  gitignored, because it describes one cluster at one moment and is")
+        print("  not a fact about the rules. Take one and re-run:")
+        print()
+        print("    python detections/posture/check_posture.py "
+              "--snapshot .telemetry/posture-snapshot.json")
+        print("    python detections/posture/test_posture.py")
+        print()
+        print("  Nothing was checked and nothing failed. Do not read this as a pass.")
+        return 0
+
     rules = cp.load_rules()
     failures: list[str] = []
     checks = 0

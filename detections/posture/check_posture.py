@@ -51,7 +51,6 @@ from typing import Any
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 RULES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "posture-rules.yml")
 DEFAULT_SNAPSHOT = os.path.join(ROOT, ".telemetry", "posture-snapshot.json")
-CONTROL_PLANE = "soc-lab-control-plane"
 
 CLUSTER_ADMIN = "cluster-admin"
 
@@ -60,14 +59,20 @@ CLUSTER_ADMIN = "cluster-admin"
 # snapshot
 # --------------------------------------------------------------------------- #
 def kubectl_json(*args: str) -> Any:
-    """Run kubectl inside the control plane and parse the result.
+    """Run kubectl and parse the result.
 
-    `docker exec` rather than a local kubectl: the kubeconfig for a kind cluster
-    lives inside the node container, and synthesising one on the host would be a
-    second source of truth for the same cluster.
+    Resolved from PATH, like every other component in this lab. The first version
+    shelled through `docker exec soc-lab-control-plane kubectl`, justified by the
+    claim that "the kubeconfig for a kind cluster lives inside the node container".
+    That is not true on a machine where kind has written a host kubeconfig -- which
+    is the normal case, and is how scan-pods.ps1, build-reachability.ps1 and the
+    attack chain all reach the cluster. The result was one component in a
+    repository that otherwise agree on how to talk to Kubernetes, and a posture
+    snapshot path that was the only thing here still working without a host
+    kubeconfig.
     """
     proc = subprocess.run(
-        ["docker", "exec", CONTROL_PLANE, "kubectl", *args, "-o", "json"],
+        ["kubectl", *args, "-o", "json"],
         capture_output=True,
         text=True,
     )

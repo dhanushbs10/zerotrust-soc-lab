@@ -13,12 +13,21 @@ and a console that shows whether an intrusion was caught. Nothing here is a simu
 | `identities/` | Workload identity definitions and trust boundaries |
 | `workloads/` | Lab applications |
 | `attack/` | Privilege paths and red-team emulation scripts |
-| `telemetry/` | Collection: audit, runtime, network |
-| `detections/` | Sigma rules, one directory per technique, each with tests |
-| `attack-data/` | ATT&CK mapping, entity schema, risk model |
-| `data/` | Graph builder and risk scoring |
+| `telemetry/` | Collection: audit, runtime, network, and the ATT&CK registry |
+| `detections/` | Sigma rules, one directory per technique, plus `posture/` for live-config checks |
+| `graph/` | Reachability derivation and its probe-based verification |
+| `tools/` | Drift, image, pod and secret scanners; the cluster-free self-test gate |
 | `dashboard/` | SOC console |
 | `docs/` | Architecture, runbook, design decisions |
+
+`attack-data/`, `data/` and `scripts/` existed as empty directories in the early
+skeleton and were listed here as if they held the ATT&CK mapping, a risk model and
+a graph builder. None of that content was ever written; the ATT&CK registry that
+does exist lives in `telemetry/tag-attack-ids.ps1`. The entries are removed rather
+than left describing something that is not there.
+
+There is one script at the repository root, `run-lab.ps1`, which is the whole lab
+in order. Read it first.
 
 ## Non-negotiable rules
 
