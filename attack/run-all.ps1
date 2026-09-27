@@ -136,16 +136,52 @@ foreach ($p in $paths) {
     $attackIds = @([regex]::Matches($out, '\[(T\d{4}(?:\.\d{3})?)\]') |
         ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique | Sort-Object)
 
+    # A failed path is re-run once before it is called CHANGED.
+    #
+    # Measured twice, on two different paths. WP-02 failed three assertions
+    # during a sweep at 20:17 and passed 5/5 immediately afterwards; PP-02 failed
+    # one assertion during a sweep and passed 7/7 when run alone. Both are the
+    # walks racing the rest of the suite -- reachability probes and API calls
+    # under load. Neither was the path changing shape.
+    #
+    # The distinction matters because "CHANGED" is a finding. A lab that reports
+    # a finding on a transient teaches its readers to discount findings, which
+    # costs more than the flake ever did. So a path that fails and then passes on
+    # an immediate retry is reported FLAKY, which is a different claim and a
+    # truthful one: it passed, but not first time.
+    $retried = $false
+    $firstCode = $code
+    if ($code -ne 0) {
+        Write-Host ("      {0} failed; re-running once to tell CHANGED from flaky" -f $p.id) -ForegroundColor DarkGray
+        $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $full 2>&1 | Out-String
+        $code = $LASTEXITCODE
+        $passed = @([regex]::Matches($out, '\[PASS\]')).Count
+        $failed = @([regex]::Matches($out, '\[FAIL\]')).Count
+        $retried = $true
+        $flaky = ($code -eq 0)
+    }
+    else {
+        $flaky = $false
+    }
+
     # Any path that exits non-zero without reporting a failure assertion has
     # crashed rather than measured something. That is a different problem from a
     # drifted path and it is worth saying which one happened.
     $crashed = ($code -ne 0 -and $failed -eq 0)
 
-    $verdict = if ($code -eq 0) { 'walkable' } elseif ($crashed) { 'ERRORED' } else { 'CHANGED' }
-    $colour = switch ($verdict) { 'walkable' { 'Green' } 'CHANGED' { 'Yellow' } default { 'Red' } }
+    $verdict = if ($code -eq 0) { $(if ($flaky) { 'FLAKY' } else { 'walkable' }) }
+               elseif ($crashed) { 'ERRORED' }
+               else { 'CHANGED' }
+    $colour = switch ($verdict) { 'walkable' { 'Green' } 'FLAKY' { 'Yellow' } 'CHANGED' { 'Yellow' } default { 'Red' } }
 
     Write-Host ("      {0,-9} exit={1}  {2} passed, {3} failed   ATT&CK: {4}" -f `
         $verdict, $code, $passed, $failed, ($attackIds -join ', ')) -ForegroundColor $colour
+
+    if ($flaky) {
+        Write-Host ("      FLAKY: failed with exit {0} on the first run, passed on an immediate retry." -f $firstCode) -ForegroundColor Yellow
+        Write-Host '      The path is walkable, but it did not go straight to it. That is worth' -ForegroundColor DarkGray
+        Write-Host '      knowing and is not the same claim as a clean pass.' -ForegroundColor DarkGray
+    }
 
     if ($crashed) {
         ($out -split "`n" | Where-Object { $_ -match 'Exception|cannot bind|is not valid|not recognized|Unable to' } |
@@ -163,6 +199,8 @@ foreach ($p in $paths) {
         passed    = $passed
         failed    = $failed
         exitCode  = $code
+        firstExitCode = $firstCode
+        retried   = $retried
         attackIds = $attackIds
     }
 
@@ -173,6 +211,7 @@ foreach ($p in $paths) {
 $totalPassed = ($results | Measure-Object -Property passed -Sum).Sum
 $totalFailed = ($results | Measure-Object -Property failed -Sum).Sum
 $notWalkable = @($results | Where-Object { $_.exitCode -ne 0 })
+$flakyPaths = @($results | Where-Object { $_.verdict -eq 'FLAKY' })
 $allAttackIds = @($results | ForEach-Object { $_.attackIds } | Select-Object -Unique | Sort-Object)
 
 # A sweep that stopped early, or whose catalogue cross-check disagreed, produced
@@ -190,6 +229,12 @@ $complete = ($pathsWalkedCount -eq $pathsExpected) -and `
 Write-Host ''
 Write-Host ('=' * 78)
 Write-Host ("  {0} path(s), {1} assertion(s) held, {2} failed" -f $results.Count, $totalPassed, $totalFailed) -ForegroundColor $(if ($totalFailed -eq 0 -and $notWalkable.Count -eq 0) { 'Green' } else { 'Red' })
+if ($flakyPaths.Count -gt 0) {
+    Write-Host ("  {0} path(s) were FLAKY: failed first, passed on retry ({1}). The build does not fail" -f `
+        $flakyPaths.Count, (($flakyPaths | ForEach-Object { $_.id }) -join ', ')) -ForegroundColor Yellow
+    Write-Host '  on these, because they are walkable -- but a path that cannot go straight to it is worth' -ForegroundColor DarkGray
+    Write-Host '  knowing about, and it is a different claim from a clean pass.' -ForegroundColor DarkGray
+}
 if (-not $complete) {
     Write-Host ("  PARTIAL SWEEP: {0} of {1} catalogued path(s) were walked." -f $pathsWalkedCount, $pathsExpected) -ForegroundColor Yellow
     Write-Host '  Treat the totals above as covering fewer paths than the catalogue, not as a smaller lab.' -ForegroundColor Yellow
@@ -223,11 +268,14 @@ $summary = [pscustomobject]@{
             kind      = $_.kind
             verdict   = $_.verdict
             exitCode  = $_.exitCode
+            firstExitCode = $_.firstExitCode
+            retried   = $_.retried
             passed    = $_.passed
             failed    = $_.failed
             attackIds = @($_.attackIds)
         }
     })
+    flakyPaths   = @($flakyPaths | ForEach-Object { $_.id })
 }
 $summaryPath = Join-Path $telemetryDir 'walk-summary.json'
 [System.IO.File]::WriteAllText(
