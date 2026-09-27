@@ -23,7 +23,22 @@ jobs:
       - name: Run pre-commit hooks
         run: |
           python -m pip install --upgrade pip pre-commit
+          # The lab's own suites need these. Without them the cluster-free gate
+          # silently cannot run the three Python suites -- the ones covering that
+          # a credential cannot leave a response and that no endpoint accepts a
+          # command -- and the hook would fail on a missing import rather than
+          # reporting a real result.
+          python -m pip install -r dashboard/requirements.txt pysigma
           pre-commit run --all-files --show-diff-on-failure
+
+      - name: The cluster-free suites, named individually
+        # Redundant with the hook on purpose. The hook proves the gate runs; this
+        # proves each suite passes, and names them in the CI log so a reader can
+        # see which controls were actually exercised.
+        run: |
+          python detections/engine/test_sigmalite.py
+          python dashboard/test_redaction.py
+          python dashboard/test_server.py
 
       - name: Kubernetes policy scan
         run: |

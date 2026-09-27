@@ -52,19 +52,25 @@ repos:
     hooks:
       - id: hadolint
 
-  # The PowerShell suites were run by hand, which is not a control. `af24b8c`
-  # fixed a bug that the `test-tag-attack-ids.ps1` seventh fixture catches: the
-  # fix commit `18a2736` shipped with that fixture already failing, because
-  # nobody re-ran the suite. These two are the cluster-free half of the test
-  # set, so they are the half that can gate a commit. Anything needing a live
-  # cluster (tools/test-boundaries.ps1, the attack sweeps) stays a manual step
-  # and must not be implied to be covered here.
+  # The suites were run by hand, which is not a control. `af24b8c` fixed a bug
+  # that the `test-tag-attack-ids.ps1` seventh fixture catches: the fix commit
+  # `18a2736` shipped with that fixture already failing, because nobody re-ran
+  # the suite. These are the suites that need no cluster, so they are the ones
+  # that can gate a commit. Anything needing a live cluster
+  # (tools/test-boundaries.ps1, the attack sweeps) stays a manual step and must
+  # not be implied to be covered here.
+  #
+  # The three Python suites were added after an audit found they ran nowhere at
+  # all -- not in this hook, not in CI. They cover the two controls that matter
+  # most in this repo: that a credential cannot leave an HTTP response, and that
+  # no endpoint accepts a command. Both were completely unenforced, in a
+  # process whose documented job is minting cluster-admin tokens.
   - repo: local
     hooks:
       - id: lab-selftest
-        name: PowerShell self-tests (no cluster required)
+        name: cluster-free test suites
         entry: >-
           powershell -NoProfile -ExecutionPolicy Bypass -File tools/run-selftests.ps1
         language: system
         pass_filenames: false
-        files: \.(ps1|ya?ml)$
+        files: \.(ps1|py|ya?ml)$

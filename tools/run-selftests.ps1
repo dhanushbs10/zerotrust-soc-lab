@@ -53,11 +53,31 @@ $suites = @(
         name = 'telemetry/test-tag-attack-ids.ps1'
         why  = 'ATT&CK registry can fail, and maps telemetry to techniques'
         path = Join-Path $projectRoot 'telemetry\test-tag-attack-ids.ps1'
+        exe  = 'powershell'
     }
     [pscustomobject]@{
         name = 'graph/test-reachability-selftest.ps1'
         why  = 'reachability derivation can fail, under mutation'
         path = Join-Path $projectRoot 'graph\test-reachability-selftest.ps1'
+        exe  = 'powershell'
+    }
+    [pscustomobject]@{
+        name = 'detections/engine/test_sigmalite.py'
+        why  = 'the Sigma evaluator can be wrong, under mutation'
+        path = Join-Path $projectRoot 'detections\engine\test_sigmalite.py'
+        exe  = 'python'
+    }
+    [pscustomobject]@{
+        name = 'dashboard/test_redaction.py'
+        why  = 'the redactor can leak a credential, under mutation'
+        path = Join-Path $projectRoot 'dashboard\test_redaction.py'
+        exe  = 'python'
+    }
+    [pscustomobject]@{
+        name = 'dashboard/test_server.py'
+        why  = 'no secret leaves a response, and no endpoint runs a command'
+        path = Join-Path $projectRoot 'dashboard\test_server.py'
+        exe  = 'python'
     }
 )
 
@@ -76,7 +96,24 @@ foreach ($s in $suites) {
         continue
     }
 
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $s.path
+    # Each suite is invoked as its own process on purpose. Dot-sourcing or
+    # in-process invocation would let one suite's Set-StrictMode and
+    # $ErrorActionPreference leak into the next, so a suite that passed in
+    # isolation could fail here for a reason that has nothing to do with it.
+    #
+    # The three Python suites were added after an audit found they ran nowhere.
+    # They need no cluster and no telemetry -- the redaction suite falls back to
+    # a clearly-fake placeholder on a fresh clone and the server suite skips the
+    # preconditions that need collected events -- and they cover the controls
+    # that matter most here: that a credential cannot leave a response, and that
+    # no endpoint accepts a command. Neither was enforced by any hook.
+    if ($s.exe -eq 'python') {
+        & python $s.path 2>&1 | ForEach-Object { Write-Host ("      {0}" -f $_) -ForegroundColor DarkGray }
+    }
+    else {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $s.path 2>&1 |
+            ForEach-Object { Write-Host ("      {0}" -f $_) -ForegroundColor DarkGray }
+    }
     $code = $LASTEXITCODE
 
     if ($code -eq 0) {

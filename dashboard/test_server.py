@@ -127,31 +127,46 @@ for path in RESPONSE_PATHS:
 # assertions above would pass on a response full of credentials.
 resp = client.get("/api/telemetry?schema=runtime/container-exec/v1&limit=500")
 text = resp.get_data(as_text=True)
-ok("the exec telemetry endpoint really does return command lines", "commandLine" in text)
-ok(
-    "the sampled window really contains the credential (else 'no leak' is vacuous)",
-    "PGPASSWORD" in text,
-    "the first 500 exec events have no PGPASSWORD command, so the redaction "
-    "assertions above would pass on a response that never held a secret",
-)
 
-# Same precondition, checked against the file rather than the response, so it
-# cannot be satisfied by redaction itself.
-telemetry = os.path.join(server.TELEMETRY, "runtime-events.jsonl")
-raw_contains = False
-if os.path.exists(telemetry):
-    with open(telemetry, encoding="utf-8") as handle:
+# Two preconditions below are only meaningful when telemetry has been collected.
+# On a fresh clone there is nothing to leak, so asserting them would fail the
+# suite for the wrong reason -- and a suite that only passes on a machine that
+# has run the collectors is a suite CI never runs. They are reported as skipped
+# rather than silently dropped, because "skipped because there was nothing to
+# test" and "passed" are different answers.
+telemetry_path = os.path.join(server.TELEMETRY, "runtime-events.jsonl")
+TELEMETRY_PRESENT = os.path.exists(telemetry_path)
+SKIPPED: list[str] = []
+
+if TELEMETRY_PRESENT:
+    ok(
+        "the exec telemetry endpoint really does return command lines",
+        "commandLine" in text,
+        "no commandLine in the response, so the leak assertions above were "
+        "satisfied by an endpoint that returned nothing",
+    )
+    ok(
+        "the sampled window really contains the credential (else 'no leak' is vacuous)",
+        "PGPASSWORD" in text,
+        "the first 500 exec events have no PGPASSWORD command, so the redaction "
+        "assertions above would pass on a response that never held a secret",
+    )
+    raw_contains = False
+    with open(telemetry_path, encoding="utf-8") as handle:
         for i, line in enumerate(handle):
             if i > 4000:
                 break
             if LIVE_SECRET in line:
                 raw_contains = True
                 break
-ok(
-    "the raw telemetry holds the live credential, so redaction has work to do",
-    raw_contains,
-    "no PGPASSWORD value found in the first 4000 lines of the raw telemetry",
-)
+    ok(
+        "the raw telemetry holds the live credential, so redaction has work to do",
+        raw_contains,
+        "no PGPASSWORD value found in the first 4000 lines of the raw telemetry",
+    )
+else:
+    SKIPPED.append("three redaction preconditions: no .telemetry/runtime-events.jsonl")
+    print("  [skip] three redaction preconditions -- no collected telemetry in this tree")
 
 print()
 print("2. no arbitrary command execution")
@@ -264,18 +279,39 @@ _ORIG_OK = server.ok
 
 
 def _break_redaction() -> list[str]:
+    """Remove the choke point and prove a credential would then escape.
+
+    Measured against a synthetic payload rather than against the collected
+    telemetry. The first version of this mutation asked a live endpoint for
+    500 exec events and looked for the password in the response, which meant it
+    proved nothing at all on a fresh clone -- where there is no telemetry, so
+    there was no secret to leak, so the mutation reported NOT CAUGHT and the
+    suite exited 1. A security test that only works on a machine that happens to
+    have run the collectors is a security test CI never runs.
+
+    The synthetic payload carries the same shape a real exec event does, so the
+    control under test is the same one either way.
+    """
     def leaky(payload, status=200):
         r = server.jsonify(payload)
         r.status_code = status
         return r
-    server.ok = leaky
+
+    probe = {"commandLine": f"sh -c env PGPASSWORD={LIVE_SECRET} psql -h postgres"}
+    original = server.ok
     try:
-        r = client.get("/api/telemetry?schema=runtime/container-exec/v1&limit=500")
-        if LIVE_SECRET in r.get_data(as_text=True):
-            return []  # the control broke, so the mutation is caught
-        return ["password still did not leak, so the redaction was not exercised"]
+        with server.app.test_request_context("/"):
+            safe = original(probe).get_data(as_text=True)
+            server.ok = leaky
+            raw = leaky(probe).get_data(as_text=True)
     finally:
-        server.ok = _ORIG_OK
+        server.ok = original
+
+    if LIVE_SECRET in safe:
+        return ["the choke point did not redact a credential-shaped payload"]
+    if LIVE_SECRET not in raw:
+        return ["removing the choke point still did not leak, so nothing was proved"]
+    return []  # the control broke and the mutation is caught
 
 
 def _break_confirmation() -> list[str]:
@@ -326,5 +362,7 @@ if FAILURES:
     sys.exit(1)
 
 print(f"PASS  {CHECKS} checks over {len(RESPONSE_PATHS)} endpoints, including 3 control mutations")
+if SKIPPED:
+    print(f"      {len(SKIPPED)} precondition(s) skipped: {'; '.join(SKIPPED)}")
 print("  a console that can mint cluster-admin tokens needs tests that can fail")
 sys.exit(0)
