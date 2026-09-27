@@ -44,6 +44,26 @@
     the pod is admitted because it claims to be something it is not. Phase 6
     established the same requirement for its probe pods.
 
+    The pod is NOT adopted by the orders-api Deployment, because a ReplicaSet
+    selector includes pod-template-hash and the foothold has none. Measured, after
+    a reviewer reasonably suspected otherwise.
+
+    Cleanup is in a finally, and that is not tidiness
+    ------------------------------------------------
+    Measured cost of getting this wrong: a run at 19:14:03 threw inside
+    Invoke-InPod at hop 6, the terminating error skipped the cleanup that sat at
+    the end of the script, and pod/exfil-20260926-191403 stayed behind. It is
+    still there six hours later, completed but retained, and it made
+    tools/scan-images.ps1 report that `zerotrust/orders-api` had changed image
+    from nginx to postgres -- a digest drift finding that was entirely an
+    artifact of the attacker's own pod. The lab looked tampered with because the
+    attack script had left litter.
+
+    A foothold that outlives the run that created it is the worst kind of mess
+    this lab can make, because it is indistinguishable from a real compromise.
+    The delete therefore runs in a finally, and a pre-flight sweep removes any
+    exfil-* pod left by an earlier run before a new one is created.
+
     Coverage gaps are reported, not hidden
     ---------------------------------------
     The catalogue claims T1078.001 and T1190 for PP-01. No telemetry schema in
@@ -102,7 +122,44 @@ Write-Host ("  Phase 8 purple-team chain  {0}" -f $stamp)
 Write-Host ('=' * 78)
 
 # ---------------------------------------------------------------------------
+# Pre-flight: clear anything an earlier run left behind.
+#
+# The chain creates a pod in the business zone, and the cleanup used to sit at the
+# end of the script where a terminating error could skip it. A run at 19:14:03
+# did exactly that, and pod/exfil-20260926-191403 survived. It is completed but
+# retained, and it made tools/scan-images.ps1 report that `zerotrust/orders-api`
+# had changed image from nginx to postgres -- a digest-drift finding that was
+# pure litter from this script and read as the lab having been tampered with.
+#
+# A foothold that outlives the run that created it is the worst kind of mess
+# this lab can make, because it is indistinguishable from a real compromise. So
+# leftovers are cleared *before* a new run as well as in a finally after it,
+# which also stops one crashed run poisoning the next.
+$stale = @(& kubectl -n zerotrust get pods -l zerotrust.lab/chain -o name 2>$null | Where-Object { $_ })
+if ($stale.Count -gt 0) {
+    Write-Host ''
+    Write-Host ("  pre-flight: removing {0} pod(s) left by an earlier run: {1}" -f `
+        $stale.Count, (($stale | ForEach-Object { ($_ -split '/')[-1] }) -join ', ')) -ForegroundColor Yellow
+    & kubectl -n zerotrust delete @stale --ignore-not-found --wait=false 2>&1 | Out-Null
+}
+
+# ---------------------------------------------------------------------------
 Write-Host ''
+$footholdCreated = $false
+trap {
+    # Only ever delete a pod THIS run created. $foothold is unset until hop 5 and
+    # $footholdCreated only becomes true once kubectl reports the create, so a
+    # failure before that must not attempt a delete of a name that might collide.
+    if ($footholdCreated -and -not $KeepPod) {
+        Write-Host ''
+        Write-Host ("  cleanup on error: deleting pod/{0}" -f $foothold) -ForegroundColor Yellow
+        & kubectl -n zerotrust delete pod $foothold --ignore-not-found --wait=false 2>&1 | Out-Null
+    }
+    Write-Host ''
+    Write-Host ("  chain aborted: {0}" -f $_.Exception.Message) -ForegroundColor Red
+    Write-Host '  the pre-flight sweep will catch anything this run missed.' -ForegroundColor DarkGray
+    exit 1
+}
 Write-Host '  hop 1  take a credential off a pod that cannot use it' -ForegroundColor Yellow
 
 $brPod = Get-LabPod -Namespace 'zerotrust-build' -App 'build-runner'
@@ -205,6 +262,11 @@ Add-Hop -Id 'hop-5' -AttackId 'T1078.001' -What 'create a foothold pod in the bu
               elseif ($podOk) { "pod created but never became Ready" }
               else { $applied.Trim() })
 
+# From here on a failure must clean up, so the trap is armed. It is armed only
+# after the pod exists, because the trap refuses to delete a name it did not
+# create.
+if ($podOk) { $footholdCreated = $true }
+
 # ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host '  hop 6  spend the stolen credential from the foothold' -ForegroundColor Yellow
@@ -247,8 +309,26 @@ Add-Hop -Id 'hop-6' -AttackId 'T1552.001' -What 'read application data with the 
               else { "no row: $($rows.Trim())" })
 
 # ---------------------------------------------------------------------------
-if (-not $KeepPod) {
+# Cleanup on a terminating error, armed BEFORE any hop runs.
+#
+# It used to sit inline at the end of the script, so any hop that threw skipped
+# it -- and one did: a run at 19:14:03 died inside Invoke-InPod at hop 6 and
+# pod/exfil-20260926-191403 survived, completed but retained, until this audit
+# found it six hours later making tools/scan-images.ps1 report that orders-api
+# had changed image from nginx to postgres.
+#
+# It is declared here rather than wrapped around the hops in a try/finally
+# because the hops are already inline and reindenting 200 lines to reach the
+# same guarantee is a far larger diff than the problem deserves. A script-scoped
+# trap fires on any terminating error from this point on.
+# ---------------------------------------------------------------------------
+# Success-path cleanup. The trap covers the failure path and this covers the
+# normal one. Neither is sufficient alone: the trap alone leaves the pod behind
+# on a clean run, and this alone is exactly what was here when a failing run
+# leaked one for six hours.
+if ($footholdCreated -and -not $KeepPod) {
     & kubectl -n zerotrust delete pod $foothold --ignore-not-found --wait=false 2>&1 | Out-Null
+    $footholdCreated = $false
     Write-Host ''
     Write-Host ("  cleanup: pod/$foothold deleted (pass -KeepPod to retain it)") -ForegroundColor DarkGray
 }
