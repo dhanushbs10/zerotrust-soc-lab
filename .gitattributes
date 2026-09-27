@@ -1,6 +1,20 @@
+# Everything is LF, including PowerShell.
+#
+# This used to declare `*.ps1 text eol=crlf`, and the pre-commit
+# mixed-line-ending hook forces LF on every staged file. The two disagreed, and
+# every commit that touched a .ps1 file became a fix-then-re-add loop: the hook
+# rewrote the file, git re-checked it out as CRLF on the next checkout, and the
+# next commit repeated it. It surfaced as `mixed line ending ... Failed` on a
+# commit whose files were already LF, which is a confusing way to learn that a
+# config file and a hook are fighting.
+#
+# LF is also the safer choice here, and not only for tidiness. A CRLF script
+# handed to busybox dies with `syntax error: unexpected end of file`, which this
+# project already hit; several attack scripts build shell fragments in a
+# PowerShell here-string and hand them to a container. LF removes that hazard
+# rather than managing it.
 * text=auto eol=lf
 
-*.ps1 text eol=crlf
 *.bat text eol=crlf
 *.cmd text eol=crlf
 

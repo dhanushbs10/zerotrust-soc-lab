@@ -2,19 +2,58 @@
 
 Phases are build order, not scope reduction. Each ends with something runnable.
 
-| # | Phase | Status | Done when |
-|---|---|---|---|
-| 0 | Foundations | **done** | repo is clean, hooks pass, one command builds a 3-node cluster |
-| 1 | Trust boundaries | **done** | namespaces default-deny; every pod has a distinct identity |
-| 2 | Least privilege | **done** | no workload holds an unneeded permission; drift fails a test |
-| 3 | Secrets and supply chain | **done** | secret sprawl and vulnerable images catalogued |
-| 4 | Privilege paths | **done** | each documented path is walkable by script |
-| 5 | Telemetry | **done** | audit, runtime, and network data tagged with ATT&CK IDs |
-| 6 | Correlation graph | **done** | who-can-reach-what answers correctly |
-| 7 | Detections | **done** | every rule fires against a real attack step |
-| 8 | Purple team | **done** | full chain runs end to end, every step detected |
-| 9 | SOC console | not started | dashboard readable during a live attack |
-| 10 | Packaging | not started | fresh clone plus one command reproduces everything |
+The status column is deliberately not a tick. Where a phase's own "done when"
+bar is not fully met, it says so, because a table that rounds a gap up to a
+checkmark is the same defect as a rule that fires on everything.
+
+| # | Phase | Status | Done when | Met? |
+|---|---|---|---|---|
+| 0 | Foundations | **done** | repo is clean, hooks pass, one command builds a 3-node cluster | yes |
+| 1 | Trust boundaries | **done** | namespaces default-deny; every pod has a distinct identity | yes |
+| 2 | Least privilege | **done** | no workload holds an unneeded permission; drift fails a test | yes |
+| 3 | Secrets and supply chain | **done** | secret sprawl and vulnerable images catalogued | yes |
+| 4 | Privilege paths | **done** | each documented path is walkable by script | yes — 7 paths, 54 assertions |
+| 5 | Telemetry | **done** | audit, runtime, and network data tagged with ATT&CK IDs | yes |
+| 6 | Correlation graph | **done** | who-can-reach-what answers correctly | yes — 25/25 verified |
+| 7 | Detections | **done, one gap** | every rule fires against a real attack step | **5 of 6** — `det-0006` (T1021) has no attack-step positive, see below |
+| 8 | Purple team | **done, one gap** | full chain runs end to end, every step detected | **5 of 6 hops** — T1078.001 has no schema, so no rule can fire on it |
+| 9 | SOC console | **done** | dashboard readable during a live attack | yes — replaced, integrated, live graph |
+| 10 | Packaging | not started | fresh clone plus one command reproduces everything | **no** — no single entry point exists |
+
+### The two gaps, stated plainly
+
+**T1021 has no attack-step positive, structurally.** The only cross-zone paths
+this lab grants are PP-02's three sensor grants, so no other workload *can*
+cross a zone. `det-0006` fires on 4 events and all 4 are the telemetry sensor's
+own probes. Adding a grant to produce a positive would weaken the lab to prove a
+point.
+
+**T1078.001 and T1190 are undetectable.** The catalogue claims both for PP-01 and
+no collected schema carries either. The chain walks hop 5 — creating a pod with
+`cluster-admin` — and nothing can observe it. `--chain` exits 1 for this reason
+and `unexercised: []` does not paper over it, because that list only covers
+techniques that have a *mapping*.
+
+## Phase 9 deliverables
+
+- `dashboard/server.py` — Flask API: 14 read endpoints, a fixed action allowlist,
+  async jobs, and a single redaction choke point every response passes through
+- `dashboard/redaction.py` — shape-based credential redaction, with its own tests
+- `dashboard/static/` — the Sentinel console: command centre, rule intelligence,
+  intrusion replay, signal explorer, trust topology, control room
+- `dashboard/static/topology.js` — the live trust-topology overlay
+- `dashboard/BUILD-SPEC.md` — the contract the console was rebuilt against
+
+The console replaces a first draft and adds the one thing that draft lacked: the
+six open paths were a flat list of rows and are now curves between the node
+cards, with arrowheads, port and measured elapsed time on each, animating while a
+collection job runs. Blocked pairs draw on demand, 19 of them, matching the API
+exactly.
+
+Three enforced properties, because this process can mint a cluster-admin token:
+loopback-only and `--host` refuses anything else; actions are a fixed allowlist
+with no endpoint that takes a command from the request; and the two mutating
+actions require `?confirm=yes` and return 409 without it.
 
 ## Phase 0 deliverables
 
@@ -796,17 +835,24 @@ paths including 19 that were dropped.
 
 ## Open decisions
 
-- **Phase 9 dashboard visual direction is unpicked.** A defensible dark SOC-console
-  aesthetic was chosen and is open to correction. Not blocking.
-- **T1078.001 and T1190 are undetectable** in this lab. The catalogue claims both
-  for PP-01, and no collected schema carries either. Closing this means adding an
-  object-creation audit schema to the registry, which is Phase 9+ work.
+- **Phase 10 is the only phase not started.** There is no single entry point;
+  driving the lab is a seven-command sequence, and Phase 10's bar is "fresh clone
+  plus one command reproduces everything".
+- **The from-scratch walkthrough has not been written.** It was asked for at the
+  start and has been deferred repeatedly in favour of building. It is the largest
+  remaining item for anyone actually understanding this project.
+- **No remote, no branch protection.** 30 commits exist only on this machine.
+- **T1078.001 and T1190 remain undetectable.** Closing it means adding an
+  object-creation audit schema to the registry, which is new collection work
+  rather than new detection work.
 - **Posture detections DET-0001, 0002, 0007, 0008, 0009 are not written.** The
   catalogue specifies what each should assert, so the specification exists without
   the implementation. They are configuration checks against live cluster state, a
   different input from the six telemetry rules.
-- Repository name: `ZeroTrust-SOC-Lab` used so far, rename if preferred.
-- Branch protection on `main`: not enabled.
+- **28 commits predate the audit and 4 followed it.** The audit below found one
+  serious defect (a leaked foothold pod) and one unenforced control (the console's
+  security suites). Both are fixed; neither was caught by any existing gate,
+  which is the more interesting result.
 - Lab vulnerabilities: synthetic misconfigurations versus pinned real CVEs.
   Current answer, recorded in `attack/catalog/privilege-paths.md`: synthetic
   misconfigurations only, no fabricated CVEs in real pinned images.
