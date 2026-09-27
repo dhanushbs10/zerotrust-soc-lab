@@ -445,6 +445,31 @@ def api_detections():
     return ok({"rules": out, "eventsConsidered": len(events)})
 
 
+def _node_label(node: Any) -> str:
+    """A short human label for one end of an observed flow.
+
+    `source` and `dest` on a flow are objects carrying ip, pod, namespace, app,
+    serviceAccount, zone and role -- there is no `name` field, and the object
+    itself stringifies into a Python dict repr when interpolated. The first
+    version of this summary did exactly that, so the console's sample panel was
+    rendering lines like:
+
+        None -> {'ip': '10.244.2.2', 'pod': 'orders-api-6cd9fc96...', ...}:8080
+
+    which is both unreadable and, worse, looks like a data problem rather than a
+    formatting one. app is the workload's identity and is what an analyst wants;
+    pod is the fallback because a probe or a foothold has no app label of its own
+    worth trusting, and a bare pod name is still better than a dict.
+    """
+    if not isinstance(node, dict):
+        return str(node) if node is not None else "?"
+    for key in ("app", "pod", "serviceAccount", "ip"):
+        value = node.get(key)
+        if value:
+            return str(value)
+    return "?"
+
+
 def _event_summary(event: dict[str, Any]) -> str:
     """One line describing an event, for a table cell."""
     schema = event.get("schema", "")
@@ -463,8 +488,8 @@ def _event_summary(event: dict[str, Any]) -> str:
         return (f"{subj.get('namespace')}/{subj.get('pod')} "
                 f"+{counter.get('deltaDenied')} denied of +{counter.get('deltaTotal')} ({event.get('baselineState')})")
     if schema == "network/observed-flow/v1":
-        src = event.get("source") or {}
-        return (f"{src.get('name')} -> {event.get('dest')}:{event.get('destPort')} "
+        return (f"{_node_label(event.get('source'))} -> "
+                f"{_node_label(event.get('dest'))}:{event.get('destPort')} "
                 f"[{event.get('scope')}/{event.get('state')}]")
     if schema == "runtime/workload-identity/v1":
         return f"{event.get('namespace')}/{event.get('pod')} as {event.get('serviceAccount')}"
