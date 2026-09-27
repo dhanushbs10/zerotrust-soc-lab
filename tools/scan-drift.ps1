@@ -512,7 +512,16 @@ $script:findings | Sort-Object key | ForEach-Object {
     Write-Host ("           {0}" -f $_.detail) -ForegroundColor DarkGray
     if ($_.attackId) { Write-Host ("           {0}" -f $_.attackId) -ForegroundColor DarkGray }
     foreach ($reason in @(Get-AcceptedReason -FindingKey $_.key)) {
-        Write-Host ("           accepted: {0}" -f $reason) -ForegroundColor DarkYellow
+        # Guarded, because $reason can legitimately be $null here and
+        # ("...{0}" -f $null) throws "Index must be greater than or equal to zero".
+        #
+        # @(function) always yields a one-element array when the function returns
+        # $null, so the loop body runs with a null argument and the whole report
+        # section dies on a finding that has no accepted-reason recorded. A crash
+        # in the reporting path is the worst place for one: the findings above it
+        # have already been judged and are now unreadable because the summary
+        # could not be formatted.
+        if ($reason) { Write-Host ("           accepted: {0}" -f $reason) -ForegroundColor DarkYellow }
     }
 }
 

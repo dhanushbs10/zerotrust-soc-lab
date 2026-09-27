@@ -411,7 +411,16 @@ Write-Host 'Reading iptables counters from the enforcement point...' -Foreground
 $chainRecords = @()
 $chainCount = 0
 foreach ($n in $nodes) {
-    $chains = Get-NodeChainNames -Node $n.container
+    # @() on the result, because the function's output is not normalised and
+    # $x.Count on $null throws under Set-StrictMode.
+    #
+    # This is not a defensive flourish: it is the fresh-cluster path. kube-router
+    # programs its pod chains some seconds after the API server answers /readyz, so
+    # a collector run against a cluster that has only just come up gets no chains
+    # at all -- and then the script dies on its own progress line with "The
+    # property 'Count' cannot be found on this object". Every other stage of this
+    # lab has a way to say "not yet"; this one had a way to crash.
+    $chains = @(Get-NodeChainNames -Node $n.container)
     foreach ($ch in $chains) {
         $rules = Get-NodeChainRules -Node $n.container -Chain $ch
         $counters = Get-NodeChainCounters -Node $n.container -Chain $ch
@@ -424,7 +433,7 @@ foreach ($n in $nodes) {
 Write-Host 'Reading conntrack for permitted connections...' -ForegroundColor Cyan
 $flows = @()
 foreach ($n in $nodes) {
-    $f = Get-NodeConntrack -Node $n.container -IpMap $ipMap
+    $f = @(Get-NodeConntrack -Node $n.container -IpMap $ipMap)
     $flows += $f
     Write-Host ("  {0,-14} {1} pod-to-pod flow(s)" -f $n.short, $f.Count) -ForegroundColor DarkGray
 }
@@ -626,6 +635,26 @@ foreach ($f in $flows) {
 }
 
 # ---------------------------------------------------------------------------
+
+# A collection that read no chains at all is not a quiet cluster, and the two must
+# never produce the same artefact.
+#
+# kube-router programs its pod chains a few seconds after the API server answers
+# /readyz, and reprograms them whenever policy changes. A run in that window reads
+# zero chains and would write a well-formed, correctly-shaped, entirely empty
+# network-events.jsonl -- which every downstream consumer reads as "no traffic was
+# refused", which is a finding. It is not a finding. It is a collector that ran too
+# early, and the most expensive kind of silence is the kind that looks like a
+# clean result.
+#
+# So this fails loudly. Waiting and re-running is the correct response, and the
+# message says so.
+if ($chainCount -eq 0) {
+    throw ("read 0 pod chains from $($nodes.Count) node(s). kube-router programs its " +
+           "chains shortly after the API server becomes ready, so this usually means " +
+           "the cluster finished starting moments ago. Wait ~30s and re-run. Do NOT " +
+           "treat the empty output as a cluster with no refused traffic.")
+}
 
 $outDir = Split-Path -Parent $OutputPath
 if (-not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
