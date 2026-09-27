@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import time
 import os
 import sys
 from typing import Any
@@ -44,6 +45,26 @@ import sigmalite  # noqa: E402
 
 TELEMETRY = os.path.join(ROOT, ".telemetry")
 RULE_GLOB = os.path.join(HERE, "*", "*.yml")
+
+# detections/posture/ holds rules too, and they are not Sigma.
+#
+# The glob above matches detections/posture/posture-rules.yml, because it is a
+# .yml inside a directory under detections/. Loading it made sigmalite raise
+# `SigmaError: no detection block`, which is the engine behaving exactly as
+# designed -- it refuses anything it does not understand rather than skipping it --
+# so the whole detection gate died on a file it was never meant to read.
+#
+# The engine was right and the caller was wrong. Posture rules are a different
+# class: they read live configuration rather than telemetry, so they carry no
+# `detection:` block and have no logsource schema. They are gated separately, by
+# detections/posture/check_posture.py.
+def rule_paths() -> list[str]:
+    """The Sigma rules, and only the Sigma rules."""
+    return sorted(
+        p
+        for p in glob.glob(RULE_GLOB)
+        if "posture" not in os.path.normpath(p).split(os.sep)
+    )
 
 # Only the two collector outputs are rule input.
 #
@@ -118,8 +139,87 @@ ALL_HITS_INSTRUMENTATION = {"det-0006-cross-zone-remote-service.yml"}
 # the baseline-free checks (liveness, schema containment, and check_for_duplicate_events).
 EXACT_BASELINE = False
 
+# The set of counts actually enforced, and where it came from.
+#
+# There are two, and they are not interchangeable.
+#
+#   EXPECTED_HITS          committed, a fingerprint of the machine that authored
+#                          it. Useful for a developer who has not moved, useless
+#                          as a gate for anyone else: a fresh clone walks the lab a
+#                          different number of times, against a differently sized
+#                          audit log, and lands on different numbers. Enforcing
+#                          this on a fresh clone guarantees a red run on correct
+#                          code, which is how a gate gets learned to ignore.
+#
+#   --baseline <file>      a RECORDED baseline, written on the first run against
+#                          this machine's own telemetry and enforced on every run
+#                          after it. .telemetry/ is gitignored, so it never
+#                          travels, and each machine gets its own. This is the gate
+#                          that can actually fail for a given user, because the
+#                          thing it compares against was measured on their cluster.
+#
+# The first run records and says so rather than passing quietly: a gate that has
+# never compared anything has not passed, it has not run.
+RECORDED_BASELINE: dict[str, int] | None = None
+BASELINE_SOURCE = "none (first run: nothing to compare against)"
+BASELINE_PATH: str | None = None
+RECORD_REQUESTED = False
+
+# Where the recorded baseline lives by default. Under .telemetry/, which is
+# gitignored: a baseline is a fingerprint of one cluster's audit window, and it
+# must not travel to another machine as though it were a fact about the rules.
+DEFAULT_BASELINE = os.path.join(TELEMETRY, "detection-baseline.json")
+
 # (rule name, expected, actual) tuples collected during a non-exact run.
 DRIFT: list[tuple[str, int, int]] = []
+
+# (rule name, precondition, how many events satisfy it) for rules this window
+# cannot judge. Reported, never silently dropped.
+NOT_JUDGEABLE: list[tuple[str, str, int]] = []
+
+
+def load_recorded_baseline(path: str) -> dict[str, int] | None:
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    hits = data.get("hits")
+    if not isinstance(hits, dict):
+        return None
+    return {str(k): int(v) for k, v in hits.items()}
+
+
+def write_recorded_baseline(
+    path: str, hits: dict[str, int], event_count: int, schema_count: int
+) -> None:
+    """Write the baseline, with the window it was measured over.
+
+    The window is part of the artefact on purpose. A count without the number of
+    events behind it cannot be interpreted later: "det-0003: 180" means nothing
+    without "over 2233 events across 7 schemas", and a reader who has forgotten
+    which telemetry produced it will either trust it too much or dismiss it
+    entirely.
+    """
+    payload = {
+        "recordedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "note": (
+            "Per-rule hit counts measured on THIS machine's telemetry. Regenerate "
+            "with test-detections.py --record-baseline after changing a rule, a "
+            "collector, or the number of times the lab has been walked -- and read "
+            "the diff before accepting it. This file is gitignored on purpose: it "
+            "is a fingerprint of one cluster's audit window, not a fact about the "
+            "rules."
+        ),
+        "eventCount": event_count,
+        "schemaCount": schema_count,
+        "hits": hits,
+    }
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
 
 
 def verify_rule(
@@ -145,15 +245,70 @@ def verify_rule(
     name = os.path.basename(rule.source)
     hits = sigmalite.match_all(rule, events)
     declared = rule.logsource.get("schema", "")
-    want = EXPECTED_HITS.get(name)
+    # The recorded baseline wins over the committed fingerprint when there is one,
+    # because it was measured on this machine's telemetry. See RECORDED_BASELINE.
+    if RECORDED_BASELINE is not None:
+        want = RECORDED_BASELINE.get(name)
+        source = "recorded"
+    else:
+        want = EXPECTED_HITS.get(name)
+        source = "committed"
 
     if want is None:
-        problems.append(f"{name}: no expected hit count declared")
+        if source == "recorded":
+            # A rule added since the baseline was recorded. Failing on it would
+            # make adding a rule look like breaking the lab, which is the wrong
+            # default -- the fix is to re-record, and the message says so.
+            problems.append(
+                f"{name}: present in the rule set but absent from the recorded "
+                f"baseline. This is a new rule, not a regression: re-record with "
+                f"--record-baseline once you have looked at what it fires on."
+            )
+        else:
+            problems.append(f"{name}: no expected hit count declared")
 
     # Liveness. Baseline-free, and the check that actually matters: a rule that
     # stopped matching is broken, whatever the count says.
-    if not hits:
+    #
+    # But liveness is only a defect if the rule's PRECONDITION is present in this
+    # window. det-0005 needs a comparable network delta, and the collector
+    # deliberately refuses to fabricate one: kube-router rebuilds its iptables
+    # chains whenever policy changes, the graph stage changes policy, and after it
+    # the deltas are `chain-rebuilt` with `deltaDenied: null`. In a window with no
+    # comparable delta the rule correctly matches nothing -- and "matched nothing"
+    # is a statement about the window, not about the rule.
+    #
+    # So a rule may declare the precondition it needs, and the gate measures
+    # whether the current telemetry can satisfy it. Unsatisfiable is reported as NOT
+    # JUDGEABLE and excluded from the verdict, loudly. It is not a suppression:
+    # the precondition is data, not an opinion, and if the data changes the rule
+    # comes back under test immediately.
+    #
+    # The escape hatch this could become is the reason it is opt-in and declared in
+    # the rule file rather than inferred. A rule cannot quietly mark itself
+    # unjudgeable.
+    precondition = rule.logsource.get("requires")
+    judgeable = True
+    if precondition:
+        field = precondition.get("field")
+        want_value = precondition.get("equals")
+        path = field.split(".") if field else []
+        candidates = events
+        for part in path:
+            candidates = [
+                c.get(part) for c in candidates
+                if isinstance(c, dict) and c.get(part) is not None
+            ]
+        satisfying = sum(1 for v in candidates if v == want_value)
+        if satisfying == 0:
+            judgeable = False
+            if record_drift:
+                NOT_JUDGEABLE.append((name, f"{field} == {want_value}", 0))
+
+    if not hits and judgeable:
         problems.append(f"{name}: matched nothing, which is indistinguishable from working")
+    if not hits and not judgeable:
+        problems = [p for p in problems if "matched nothing" not in p]
 
     # The exact equality is a FINGERPRINT, enforced only against a quiesced
     # window. It is deliberately not a floor, because a floor cannot fail.
@@ -164,16 +319,42 @@ def verify_rule(
     # walked -- and the gate therefore could not pass twice in succession after a
     # walk, no matter how correct everything was. The harness's own --chain help
     # text already conceded the tension ("walking the lab changes those counts by
-    # design") while the default path kept enforcing them.
+    # design") while the default path still enforced them.
     #
-    # So the count is checked for exactness only when the caller states the
-    # window is closed (--exact-baseline), which the one-command run does right
-    # after collecting and before walking anything. Everywhere else the drift is
-    # reported, because a number nobody can reproduce is a number that cannot
-    # fail, and a number that cannot fail is decoration.
+    # A recorded baseline is enforced automatically, because it was measured
+    # against this machine's own telemetry and the run that just collected is the
+    # thing it should be compared to. The committed fingerprint is only enforced
+    # when the caller explicitly asks with --exact-baseline, because it was
+    # measured on someone else's audit window and no fresh clone can reproduce it.
+    #
+    # Either way the number is a fingerprint rather than a target, and a drift
+    # that is not enforced is still printed: a number nobody can reproduce is a
+    # number that cannot fail, and a number that cannot fail is decoration.
     if want is not None and EXACT_BASELINE and len(hits) != want:
-        problems.append(f"{name}: {len(hits)} hits, expected exactly {want}")
-    if want is not None and not EXACT_BASELINE and record_drift and len(hits) != want:
+        # Only a judgeable rule is held to its count. Holding an unjudgeable rule to
+        # a number recorded in a window that could satisfy it would be enforcing a
+        # precondition the current telemetry does not meet.
+        if judgeable:
+            problems.append(
+                f"{name}: {len(hits)} hits, {source} baseline says exactly {want}"
+            )
+        else:
+            # Printed only from the real pass. The mutation harness re-runs this
+            # function on a deliberately broken rule, and three copies of the same
+            # notice in one report trains the reader to skip the line that matters.
+            if record_drift:
+                print(
+                    f"  {name:<44} NOT JUDGEABLE this window: needs "
+                    f"{precondition.get('field')} == {precondition.get('equals')}, "
+                    f"and 0 event(s) provide it"
+                )
+    if (
+        want is not None
+        and not EXACT_BASELINE
+        and record_drift
+        and len(hits) != want
+        and judgeable
+    ):
         DRIFT.append((name, want, len(hits)))
 
     wrong = [h for h in hits if h.get("schema") != declared]
@@ -281,7 +462,7 @@ def load_events() -> list[dict[str, Any]]:
 
 
 def load_rules() -> list[sigmalite.Rule]:
-    paths = sorted(glob.glob(RULE_GLOB))
+    paths = rule_paths()
     if not paths:
         print(f"no rules matched {RULE_GLOB}", file=sys.stderr)
         sys.exit(2)
@@ -341,13 +522,80 @@ def main() -> int:
             "afterwards reports the lab as broken when the fingerprint is what moved."
         ),
     )
+    parser.add_argument(
+        "--baseline",
+        metavar="PATH",
+        help=(
+            "enforce the per-rule hit counts recorded at PATH, and treat a mismatch "
+            "as a failure. This is the gate that works across machines: the counts "
+            "were measured on your own telemetry, so they are reproducible by you. "
+            "If the file does not exist it is recorded from the current run and the "
+            "run says so rather than passing quietly."
+        ),
+    )
+    parser.add_argument(
+        "--record-baseline",
+        metavar="PATH",
+        help=(
+            "write the per-rule hit counts to PATH from the current telemetry, "
+            "overwriting whatever was there. Read the diff before committing to it: "
+            "re-recording is how a real regression gets accepted as a new normal."
+        ),
+    )
     args = parser.parse_args()
-    global EXACT_BASELINE
+    global EXACT_BASELINE, RECORDED_BASELINE, BASELINE_PATH, RECORD_REQUESTED
     EXACT_BASELINE = bool(args.exact_baseline)
+    RECORD_REQUESTED = bool(args.record_baseline)
+
+    baseline_path = args.baseline or DEFAULT_BASELINE
+    if args.record_baseline:
+        baseline_path = args.record_baseline
+
+    # The recorded baseline is OPT-IN, and that is a correction rather than a
+    # preference.
+    #
+    # The first version auto-enabled it whenever the file existed, on the reasoning
+    # that a baseline measured on this machine must be worth more than the committed
+    # one. Measured consequence: the default `python detections/test-detections.py`
+    # FAILED with `det-0006: 3 hits, recorded baseline says exactly 4`, because the
+    # lab had been walked since the baseline was recorded and one cross-zone flow no
+    # longer appeared.
+    #
+    # That is the identical defect I had already fixed for the committed table, and I
+    # reintroduced it one function away. The committed counts became un-enforceable
+    # because no fresh clone can reproduce them; the recorded counts are equally
+    # un-enforceable because no *repeat* run can reproduce them either. Every walk of
+    # this lab changes the audit window by design. A gate that fails every time the
+    # tool is used is a gate that gets ignored, and a gate that gets ignored protects
+    # nothing.
+    #
+    # So: counts are enforced when the caller asks with --baseline, reported as drift
+    # otherwise, and the default gate rests entirely on the baseline-free properties.
+    # The recorded baseline is the tool for the rule-editing loop, where you collect
+    # once, record, then re-run the gate and want it to hold you to a number.
+    if args.baseline:
+        recorded = load_recorded_baseline(args.baseline)
+        if recorded is not None:
+            RECORDED_BASELINE = recorded
+            EXACT_BASELINE = True
+            print(f"enforcing the recorded baseline at {args.baseline}")
+        else:
+            # Announced AND done. A promise in the output that the code does not keep
+            # is worse than silence: it teaches the reader to trust a line that is
+            # not true.
+            RECORD_REQUESTED = True
+            print(
+                f"no baseline at {args.baseline} yet -- recording one from this run. "
+                f"Re-run with --baseline to enforce it. A gate that has never compared "
+                f"anything has not passed, it has not run."
+            )
+    elif args.record_baseline:
+        RECORD_REQUESTED = True
+    BASELINE_PATH = args.baseline or args.record_baseline
 
     events = load_events()
     rules = load_rules()
-    paths = sorted(glob.glob(RULE_GLOB))
+    paths = rule_paths()
 
     if args.chain:
         return chain_mode(events, rules)
@@ -591,19 +839,66 @@ def gate_mode(events: list[dict[str, Any]], rules: list[sigmalite.Rule], paths: 
         rule.condition = original_condition
         rule._tokens = original_tokens
 
+    # --- 4. record the baseline, so the NEXT run has something to check ----
+    #
+    # Recorded last and unconditionally when asked for, and deliberately not
+    # conditional on the run passing. A baseline captured only from a green run
+    # is a baseline that cannot record a regression: the run that would have
+    # caught the regression is exactly the run whose numbers you would not trust.
+    if RECORD_REQUESTED and BASELINE_PATH:
+        measured = {name: len(results[name]) for name in sorted(results)}
+        write_recorded_baseline(
+            BASELINE_PATH,
+            measured,
+            event_count=len(events),
+            schema_count=len({e.get("schema") for e in events if isinstance(e.get("schema"), str)}),
+        )
+        print()
+        print("baseline")
+        print("-" * 70)
+        print(f"  wrote {BASELINE_PATH}")
+        for bname, count in measured.items():
+            prior = (RECORDED_BASELINE or {}).get(bname)
+            if prior is None:
+                print(f"    {bname:<44} {count:>5}   (new)")
+            elif prior != count:
+                print(f"    {bname:<44} {count:>5}   (was {prior}, {count - prior:+d})")
+            else:
+                print(f"    {bname:<44} {count:>5}   (unchanged)")
+        if RECORDED_BASELINE:
+            print("  Read the deltas above before accepting them. Every one of them is")
+            print("  a claim that the change was understood rather than absorbed.")
+
     # --- verdict ---------------------------------------------------------
+    if NOT_JUDGEABLE:
+        print()
+        print("not judgeable in this window")
+        print("-" * 70)
+        for jname, jcond, jsat in NOT_JUDGEABLE:
+            print(f"  {jname}")
+            print(f"    needs {jcond}; {jsat} event(s) in the current telemetry provide it")
+        print("  The rule is neither passed nor failed here. It is excluded from the")
+        print("  verdict because the telemetry cannot exercise it, and it comes back")
+        print("  under test the moment the window can.")
+        print()
+        print("  One consequence, stated rather than left to be discovered: a mutation")
+        print("  that makes a rule match NOTHING is indistinguishable from a rule that")
+        print("  already matched nothing. For these rules the 'impossible value'")
+        print("  mutation therefore reports `equivalent` in such a window, and that is")
+        print("  not a clean result. It is missing coverage, and the only fix is a")
+        print("  window that can judge the rule.")
+
     if DRIFT:
         print()
-        print("baseline drift (not enforced without --exact-baseline)")
+        print("baseline drift (not enforced in this mode)")
         print("-" * 70)
         for dname, want, got in DRIFT:
             delta = got - want
             print(f"  {dname:<44} baseline {want:>5}  now {got:>5}  ({delta:+d})")
         print("  The audit log is cumulative and rotates. Every chain run adds one")
         print("  exec, one portforward, one token request and one created pod, so these")
-        print("  move by design. Re-run with --exact-baseline against a freshly")
-        print("  collected window to enforce them as equalities, and update the table")
-        print("  in EXPECTED_HITS if the drift is understood.")
+        print("  move by design. --exact-baseline enforces the committed fingerprint,")
+        print("  --baseline enforces your own recorded one.")
 
     print()
     print("=" * 70)
